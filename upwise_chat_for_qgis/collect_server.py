@@ -101,7 +101,7 @@ SERVER_NAME = "upwise_collect"
 # 모듈을 import 할 수 없어서, 상수로 두고 드리프트는 하네스가 잡는다
 # (23 의 A6: SERVER_VERSION == metadata.txt 의 version, 양성 대조군 A6_pos).
 # 릴리스 때 metadata.txt 를 올리면 여기도 같이 올린다.
-SERVER_VERSION = "0.5.4"
+SERVER_VERSION = "0.6.0"
 
 # --------------------------------------------------------------- 환경변수 계약
 # 전부 플러그인이 per-server env 블록으로 넣는다. **키는 여기 없다.**

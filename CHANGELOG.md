@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.6.0
+
+A seam under the CLI session for a second backend, a portal search link where
+the data.go.kr catalogue runs out, and two charts under a bottom navigation in
+the dock. The repository this release ships from was restarted in public.
+
+- **A backend adapter layer, with the behaviour held equal.** The session the
+  dock drives now sits behind an interface: `backend/adapter.py` declares it,
+  `backend/adapter_claude.py` delegates to the Claude Code CLI path that was
+  already there, and `backend/adapter_registry.py` chooses one. The Claude
+  adapter forwards rather than reimplements, and the claim that nothing moved
+  is carried by an equality check rather than by this description: 48 argv
+  combinations, the environment block, 10 startup gates and a replay of the
+  wire protocol and the state machine return the same digests as the code
+  before the layer existed (42 checks, 0 failures). The slot for a second
+  backend, the Codex CLI, is empty in this release.
+- **The vendored code execution handler refuses instead of calling exec().**
+  `execute_code` has not been exposed since 0.3.0: the blocked command list
+  holds it and the dispatcher refuses it by name before a handler runs, so
+  the vendored body was unreachable. That body is now a structured refusal
+  carrying the dispatcher's own wording, because the upload scan at
+  plugins.qgis.org treats an `exec()` call as a blocking finding whether or
+  not a request can reach it. The signature, the decorator and the file
+  around it are left alone so the diff against upstream stays mechanical.
+  This is the eleventh recorded change to the vendored copy, and the 19
+  recorded upstream digests in `VENDOR.md` do not move; the consistency gate
+  over the vendored tree reports 111 checks and 0 failures, and it fails on a
+  copy with this change reverted.
+- **Registration metadata.** `metadata.txt` drops `category`, whose value was
+  outside the allowed list, and gains `tags` and a short `changelog` block.
+  The `about` text now says where this was measured: development and testing
+  ran on Windows 10 and 11 with QGIS 3.44, Linux and macOS are untested, and
+  one path, killing a stuck CLI process tree, is written for Windows only.
+- **data.go.kr: a portal search link where the catalogue ends.** A dataset
+  list that comes back with no rows now carries a `portal_search` block with
+  one link into the portal's own search page. The three parts of that
+  address, the base URL, the fixed parameters and the name of the query
+  parameter, come from the shipped catalogue declaration; the server builds
+  the link and does not fetch it, and the portal list pages that its
+  `robots.txt` disallows stay unvisited. The link rides on an empty result
+  only, since an empty result is what "not in the shipped catalogue" looks
+  like, and a call with candidates spends no bytes on the notice. The query
+  parameter name is declared rather than measured: opening the link once in a
+  browser is what settles it, and the catalogue note says so. The collection
+  checks around this come to 157 with 0 failures.
+- **Two charts in the dock.** A usage card draws the 5 hour and 7 day
+  utilization that the stream's rate limit event carries, next to the session
+  cost summed from the result events. A collection card counts collection
+  runs per provider from the sidecar files under the profile workspace.
+  Neither card adds a dependency: the bars are QPainter fills and the text is
+  QLabel, and neither card file carries a hardcoded color value, so the cards
+  draw from theme tokens that were already there. The 14 contrast pairs for
+  this round come out at 6.256 or better for text and 3.266 for decoration
+  (29 checks, 0 failures).
+- **A bottom navigation.** One row under the input picks what the dock shows:
+  the chat, the key panel, or the statistics panel that holds the two charts.
+  The statistics panel is closed by default, and it rereads the collection
+  sidecars when it opens rather than while it is closed (27 checks, 0
+  failures). The floating treatment of that row is an approximation of the
+  design reference, not a match to it.
+- **Section titles wrap instead of clipping.** A folded section title wider
+  than the body viewport used to lose its tail. The titles now break across
+  lines, and at the narrowest dock width the children measured wider than the
+  viewport go from 2 to 0.
+- **Recorded test fixtures no longer carry a local account name.** The four
+  recorded stream fixtures held 26 occurrences of a developer account name
+  across 4 spellings. They are replaced, and the two generators that write
+  these fixtures now apply the same substitution, so a regeneration applies
+  it as well.
+- **The repository history was restarted.** This release ships from a public
+  repository whose history begins at a single root commit; the earlier
+  history is kept in a private archive repository and in a local bundle.
+
 ## 0.5.4
 
 One UI fix, reported from the same live session on 2026-10-19: putting words
