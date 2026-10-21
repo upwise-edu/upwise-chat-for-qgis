@@ -1,0 +1,204 @@
+{
+  "schema": 1,
+  "note": "data.go.kr (Korean public data portal) provider definition and the two registration presets. This file ships ZERO datasets on purpose: the portal has no machine readable catalog API, so every data.go.kr dataset enters through the user registration file <profile>/upwise_chat/collect_user_registry.json, whose ids must start with \"user.\". The collect server merges this file for the provider block (key setting, key format, notices); the presets block is read by the plugin UI to prefill a new record. Design: docs/8.collect_expansion_design_v1.md sections 3-5, 4-1 and 4-3.",
+  "note_envelope_source": "The two envelopes below were taken from the author's own working collectors, not from a specification page: 04.lectures/05.inflearn_qgis_mcp/scripts/collect/collect_store.py (JSON: header.resultCode, body.items, body.totalCount, pageNo/numOfRows, type=json) and collect_realprice.py (XML: .//resultCode with 00 or 000, .//item, .//totalCount). The generality of those two samples across other agencies is UNVERIFIED (docs/8 U11): some agencies wrap one more level (response.header...) or nest one step deeper (body.items.item). That is why every envelope field here is a preset default the user can edit in the advanced section, and why the server fails loudly instead of reporting a silent zero when a declared path is absent.",
+  "note_key_panel": "The key panel reads keystore.load_providers(), which merges this file with collect_registry.json and the other shipped catalogs in the same order the collect server uses (keystore.CATALOG_SIBLINGS mirrors collect_server.CATALOG_SIBLINGS, and harness 24 A11 asserts the two lists are equal). So this provider shows up in the panel from this file: it needs no entry in collect_registry.json. The panel reads key_setting for the input box, key_re and key_form for the save-time check (percent encoded values are refused at the input, because qsettings_unescape decodes on read and an Encoding key cannot be told from a Decoding key afterwards), key_label and key_hint for the label and the refusal reason, and approval_notice and quota_notice for the two fixed lines of the registration section - those two strings are the canonical copy and harness 24 asserts they match the panel constants verbatim. The registration presets are read from the top level presets list of this file.",
+  "provider": "data_go_kr",
+  "providers": {
+    "data_go_kr": {
+      "title": "공공데이터포털 (data.go.kr)",
+      "signup": "https://www.data.go.kr/",
+      "key_setting": "upwise_chat/keys/data_go_kr",
+      "key_label": "서비스키 (Decoding)",
+      "key_form": "decoding",
+      "key_re": "^[A-Za-z0-9+/=._~-]{20,256}$",
+      "key_hint": "포털 마이페이지의 일반 인증키 두 종류 중 Decoding 키를 넣으세요. Encoding 키(퍼센트 인코딩 %XX 가 보이는 쪽)를 넣으면 서버가 한 번 더 인코딩해 서비스키 미등록 오류가 납니다.",
+      "approval_notice": "data.go.kr 은 API 마다 활용신청 승인이 있어야 호출됩니다.",
+      "approval_notice_detail": "키는 포털 공통이지만 API 마다 활용신청과 승인이 따로 필요합니다.",
+      "quota_notice": "일일 호출 한도는 API 마다 다르고 공개되지 않는 경우가 많습니다.",
+      "register_notice": "엔드포인트 주소는 https 로 시작해야 하고, 물음표 뒤의 질의 문자열은 넣지 않습니다. 호출 파라미터는 고정값과 가변값 칸으로 따로 넣으세요. 저장할 때 네트워크 요청은 가지 않습니다 - 실제 확인은 첫 수집이 겸합니다.",
+      "portal_search": {
+        "base_url": "https://www.data.go.kr/tcs/dss/selectDataSetList.do",
+        "fixed_params": {"dType": "API"},
+        "query_param": "keyword",
+        "notice": "플러그인 카탈로그에 없는 data.go.kr 데이터는 포털에서 직접 찾습니다. 링크를 열어 오픈API 를 고르고 활용신청을 한 뒤, 승인되면 키 패널의 등록 섹션에서 등록하세요. 플러그인은 이 주소를 조회하지 않습니다."
+      }
+    }
+  },
+  "note_portal_search": "The portal_search block is the shipped declaration behind option (c) of the 4th measurement in docs/3.provider_catalog_survey_v1.md: the plugin generates a portal search link and never crawls the portal. Option (a), shipping a full snapshot of the 12,015 open API datasets, was rejected there because www.data.go.kr/robots.txt lists Disallow /tcs/dss/selectDataSetList.do, which is exactly that list page [measured 2026-10-17]. Provenance of the three fields: base_url (the list page path) and fixed_params dType=API were measured on 2026-10-17 (the dType=API tab reports 12,015 open APIs, 1,202 pages, and currentPage works as a GET parameter). query_param NOT VERIFIED: the name comes from a third party scraper's documented input fields (apify.com/parseforge/data-go-kr-scraper, which also documents svcType with FILE/API/STD/LINKED), never from a portal page we read, and verifying it means opening the link in a browser once - the server must not fetch it. If the name is wrong the link still lands on the open API list, which is why the server treats it as a declaration and not as code: the collect server reads base_url, fixed_params and query_param from here and urlencodes the user's search words into the query parameter. The notice string is the canonical copy of the model facing and user facing sentence, and harness 23 (NL group) asserts the server returns it verbatim.",
+  "datasets": [],
+  "presets": [
+    {
+      "preset_id": "datago_json_standard",
+      "title": "data.go.kr JSON 표준형",
+      "desc": "응답이 header/body 두 블록으로 오고 body.items 가 레코드 목록인 계열. 사용자가 넣는 것은 엔드포인트 주소와 데이터셋 이름, 그리고 그 API 고유의 호출 파라미터뿐입니다.",
+      "user_fills": [
+        "id",
+        "title",
+        "base_url",
+        "params",
+        "required"
+      ],
+      "advanced_fields": [
+        "fixed_params",
+        "key_param",
+        "response.items_path",
+        "response.error.code_path",
+        "response.error.ok",
+        "response.error.msg_path",
+        "response.lon_field",
+        "response.lat_field",
+        "response.crs",
+        "paging.total_path",
+        "paging.page_param",
+        "paging.size_param",
+        "paging.max_pages"
+      ],
+      "record": {
+        "provider": "data_go_kr",
+        "auth": "key_query",
+        "key_param": "serviceKey",
+        "fixed_params": {
+          "type": "json"
+        },
+        "params": {},
+        "required": [],
+        "bbox_param": "",
+        "crs_param": "",
+        "max_features_param": "",
+        "default_crs": "",
+        "allowed_crs": [],
+        "format": "json",
+        "page_limit": 1000,
+        "paging": {
+          "mode": "page_no",
+          "page_param": "pageNo",
+          "size_param": "numOfRows",
+          "size": 1000,
+          "total_path": "body.totalCount"
+        },
+        "response": {
+          "kind": "json_records",
+          "items_path": "body.items",
+          "error": {
+            "code_path": "header.resultCode",
+            "ok": [
+              "00",
+              "0"
+            ],
+            "msg_path": "header.resultMsg"
+          }
+        },
+        "verified": false,
+        "supported": true
+      },
+      "note_page_size": "한 페이지 건수는 collect 의 max_features 인자가 정하고 page_limit 이 상한을 자릅니다. 페이지 번호는 서버가 매깁니다 - 그래서 numOfRows 와 pageNo 를 params 에 두지 않습니다(같은 축에 손잡이가 둘이면 어느 쪽이 이겼는지 사이드카에서 읽히지 않습니다).",
+      "note_coordinates": "응답 레코드에 경위도 필드가 있으면 response.lon_field 와 response.lat_field 를 고급 칸에서 채우세요. 그러면 수집 결과로 파생 GeoJSON 포인트가 생기고 layer_path 가 찹니다. 비우면 records.csv 와 table_path 입니다.",
+      "example": {
+        "note": "봉투 측정에 쓴 실제 API 입니다. 자동 등록하지 않습니다 - 활용신청 승인은 계정마다 다릅니다.",
+        "title": "소상공인시장진흥공단 상가(상권)정보",
+        "base_url": "https://apis.data.go.kr/B553077/api/open/sdsc2/storeListInDong",
+        "params": {
+          "divId": {
+            "type": "str",
+            "desc": "구분 코드. 저자 수집기가 쓴 값은 signguCd(시군구) 입니다."
+          },
+          "key": {
+            "type": "str",
+            "desc": "divId 에 맞는 코드값. signguCd 면 시군구코드 5자리(예: 대전 서구 30170)."
+          }
+        },
+        "required": [
+          "divId",
+          "key"
+        ],
+        "response_extra": {
+          "lon_field": "lon",
+          "lat_field": "lat",
+          "crs": "EPSG:4326"
+        }
+      }
+    },
+    {
+      "preset_id": "datago_xml_standard",
+      "title": "data.go.kr XML 표준형",
+      "desc": "응답이 XML 로 오고 item 엘리먼트가 레코드인 계열. 좌표가 없는 경우가 많아 결과는 records.csv 와 table_path 로 옵니다.",
+      "user_fills": [
+        "id",
+        "title",
+        "base_url",
+        "params",
+        "required"
+      ],
+      "advanced_fields": [
+        "fixed_params",
+        "key_param",
+        "response.items_path",
+        "response.error.code_path",
+        "response.error.ok",
+        "response.error.msg_path",
+        "paging.total_path",
+        "paging.page_param",
+        "paging.size_param",
+        "paging.max_pages"
+      ],
+      "record": {
+        "provider": "data_go_kr",
+        "auth": "key_query",
+        "key_param": "serviceKey",
+        "fixed_params": {},
+        "params": {},
+        "required": [],
+        "bbox_param": "",
+        "crs_param": "",
+        "max_features_param": "",
+        "default_crs": "",
+        "allowed_crs": [],
+        "format": "xml",
+        "page_limit": 1000,
+        "paging": {
+          "mode": "page_no",
+          "page_param": "pageNo",
+          "size_param": "numOfRows",
+          "size": 1000,
+          "total_path": ".//totalCount"
+        },
+        "response": {
+          "kind": "xml_records",
+          "items_path": ".//item",
+          "error": {
+            "code_path": ".//resultCode",
+            "ok": [
+              "00",
+              "000"
+            ],
+            "msg_path": ".//resultMsg"
+          }
+        },
+        "verified": false,
+        "supported": true
+      },
+      "note_xml_parser": "XML 은 표준 라이브러리 xml.etree.ElementTree 로 읽습니다. 이 파서는 entity 확장 계열(billion laughs 등)에 취약하고, defusedxml 은 표준 라이브러리가 아니라 단일 파일 제약 아래 쓸 수 없습니다. 완화는 응답 바이트 상한과 페이지 상한뿐이며 가드가 아닙니다.",
+      "note_page_size": "JSON 표준형과 같습니다. 페이지 크기는 max_features, 페이지 번호는 서버입니다.",
+      "example": {
+        "note": "봉투 측정에 쓴 실제 API 입니다. 자동 등록하지 않습니다 - 활용신청 승인은 계정마다 다릅니다.",
+        "title": "국토교통부 아파트 매매 실거래가",
+        "base_url": "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade",
+        "params": {
+          "LAWD_CD": {
+            "type": "str",
+            "desc": "법정동 시군구 코드 5자리(예: 대구 수성구 27260)."
+          },
+          "DEAL_YMD": {
+            "type": "str",
+            "desc": "계약 연월 YYYYMM."
+          }
+        },
+        "required": [
+          "LAWD_CD",
+          "DEAL_YMD"
+        ]
+      }
+    }
+  ]
+}

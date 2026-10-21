@@ -1,0 +1,76 @@
+UPWISE Chat for QGIS
+Copyright (C) 2026 UPWISE
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 2 of the License, or (at your option) any later
+version. The full license text is in the LICENSE file.
+
+Trademark notice / 상표 고지
+
+  The code license (GPL) does not grant any right to use the UPWISE name,
+  logo or wordmark as a trademark.
+  이 코드 라이선스(GPL)는 UPWISE 이름, 로고, 워드마크의 상표 사용권까지
+  부여하지 않는다.
+
+  Applies to, among others:
+    upwise_chat_for_qgis/resources/logo_upwise@2x.png
+    upwise_chat_for_qgis/resources/icon.png
+
+--------------------------------------------------------------------------
+Third-party code / 제3자 코드
+
+This distribution contains code UPWISE did not write and does not own.
+UPWISE is a licensee of it. Both items below come from the same upstream
+project, which is itself dual-licensed; the dual licensing is upstream's
+doing, not ours, and we are not in a position to relicense anyone's work.
+이 배포물에는 UPWISE 가 작성하지 않았고 소유하지도 않은 코드가 들어 있다.
+UPWISE 는 그 코드의 라이선시다.
+
+1) qgis_mcp_plugin 0.15.0 - the QGIS-side socket server and tool execution
+   Copyright (c) Nicolas Karasiak
+   License: GPL-2.0-or-later
+   Upstream: https://github.com/nkarasiak/qgis-mcp (tag v0.15.0)
+   Location in this distribution: upwise_chat_for_qgis/mcpserver/
+   Full license text: upwise_chat_for_qgis/mcpserver/LICENSE.upstream
+   Modifications: 10 points, listed in upwise_chat_for_qgis/mcpserver/VENDOR.md
+     with a sha256 per file. Every file carries a provenance header, and
+     changed files carry a GPLv2 section 2(a) change notice.
+
+   Redistributing this under GPL-2.0-or-later, as this whole distribution is,
+   is ordinary compliance. No separate permission was needed or obtained.
+
+2) qgis-mcp 0.15.0 - tool schemas only, no code
+   Copyright (c) 2025 Nicolas Karasiak
+   License: MIT
+   Upstream: https://github.com/nkarasiak/qgis-mcp (tag v0.15.0)
+   Derived artifact in this distribution: upwise_chat_for_qgis/qgis_tools.json
+
+   That file holds the 78 tool schemas this product exposes, extracted at
+   build time from the upstream MIT bridge's generated schemas. No upstream
+   code is included - qgis_bridge.py is UPWISE's own. MIT permits the
+   derivation and the redistribution under GPL, and requires the notice
+   below to be preserved:
+
+     MIT License
+
+     Copyright (c) 2025 Nicolas Karasiak
+
+     Permission is hereby granted, free of charge, to any person obtaining a
+     copy of this software and associated documentation files (the
+     "Software"), to deal in the Software without restriction, including
+     without limitation the rights to use, copy, modify, merge, publish,
+     distribute, sublicense, and/or sell copies of the Software, and to
+     permit persons to whom the Software is furnished to do so, subject to
+     the following conditions:
+
+     The above copyright notice and this permission notice shall be included
+     in all copies or substantial portions of the Software.
+
+     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+     OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+     MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+     IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+     CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+     TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+     SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

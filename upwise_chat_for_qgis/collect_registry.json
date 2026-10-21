@@ -1,0 +1,134 @@
+{
+  "schema": 1,
+  "note": "Endpoint registry for the upwise_collect MCP server. The model never builds a URL; it picks an id from this file. Common call parameters live in providers.<id>.templates.<name> and a dataset inherits them with \"template\": \"<name>\"; values written on the dataset win, and fixed_params / params / response / paging merge key by key. The response block is a declaration: the server reads only the declared items_path and fails loudly when that path is absent, instead of reporting a silent zero. V-World endpoint and parameter names were taken from the author's own working collector (bbox is interpreted in the srsName CRS, so requests go out as EPSG:4326 and reprojection is left to QGIS or the preprocess step). Catalog files merged at runtime: this file, collect_catalog_vworld.json, collect_catalog_sgis.json (both optional, shipped) and <profile>/upwise_chat/collect_user_registry.json (user records, ids must start with \"user.\").",
+  "providers": {
+    "vworld": {
+      "title": "V-World (Korean national spatial data open API)",
+      "key_setting": "upwise_chat/keys/vworld",
+      "signup": "https://www.vworld.kr/dev/v4api.do",
+      "templates": {
+        "wfs": {
+          "auth": "key_query",
+          "base_url": "https://api.vworld.kr/req/wfs",
+          "key_param": "key",
+          "typename_param": "typename",
+          "bbox_param": "bbox",
+          "crs_param": "srsName",
+          "max_features_param": "maxFeatures",
+          "fixed_params": {
+            "service": "WFS",
+            "version": "1.1.0",
+            "request": "GetFeature",
+            "output": "application/json",
+            "domain": "localhost"
+          },
+          "params": {
+            "bbox": "minx,miny,maxx,maxy in EPSG:4326 (lon,lat)",
+            "max_features": "per-request cap, server clamps to 1000",
+            "crs": "request CRS, EPSG:4326 only"
+          },
+          "required": ["bbox"],
+          "paging": "tile_subdivide",
+          "page_limit": 1000,
+          "format": "geojson",
+          "default_crs": "EPSG:4326",
+          "allowed_crs": ["EPSG:4326"],
+          "response": {
+            "kind": "geojson",
+            "items_path": "features"
+          }
+        }
+      }
+    }
+  },
+  "datasets": [
+    {
+      "id": "vworld.lt_c_adsigg",
+      "provider": "vworld",
+      "template": "wfs",
+      "title": "Sigungu administrative boundary (lt_c_adsigg)",
+      "geometry": "Polygon",
+      "typename": "lt_c_adsigg",
+      "verified": true,
+      "supported": true,
+      "notes": "Attributes include sig_cd, sig_kor_nm, full_nm. Match on sig_cd; the 2026 edition renamed several full_nm values."
+    },
+    {
+      "id": "vworld.lt_c_uq111",
+      "provider": "vworld",
+      "template": "wfs",
+      "title": "Zoning - urban area (lt_c_uq111)",
+      "geometry": "Polygon",
+      "typename": "lt_c_uq111",
+      "verified": true,
+      "supported": true,
+      "notes": "Use a small bbox first. Dense city areas hit the 1000 feature cap and the server subdivides the request."
+    },
+    {
+      "id": "vworld.lt_c_uq112",
+      "provider": "vworld",
+      "template": "wfs",
+      "title": "Zoning - management area (lt_c_uq112)",
+      "geometry": "Polygon",
+      "typename": "lt_c_uq112",
+      "verified": false,
+      "supported": true,
+      "notes": "Non-urban management area."
+    },
+    {
+      "id": "vworld.lt_c_uq113",
+      "provider": "vworld",
+      "template": "wfs",
+      "title": "Zoning - agriculture and forestry area (lt_c_uq113)",
+      "geometry": "Polygon",
+      "typename": "lt_c_uq113",
+      "verified": false,
+      "supported": true,
+      "notes": "Agriculture and forestry area."
+    },
+    {
+      "id": "vworld.lt_c_uq114",
+      "provider": "vworld",
+      "template": "wfs",
+      "title": "Zoning - natural environment conservation area (lt_c_uq114)",
+      "geometry": "Polygon",
+      "typename": "lt_c_uq114",
+      "verified": false,
+      "supported": true,
+      "notes": "Natural environment conservation area."
+    },
+    {
+      "id": "vworld.lt_l_sprd",
+      "provider": "vworld",
+      "template": "wfs",
+      "title": "Road centerline from the road name address set (lt_l_sprd)",
+      "geometry": "LineString",
+      "typename": "lt_l_sprd",
+      "verified": true,
+      "supported": true,
+      "notes": "Very dense. Keep the bbox small or the request hits the page and byte limits."
+    },
+    {
+      "id": "vworld.lt_c_wkmstrm",
+      "provider": "vworld",
+      "template": "wfs",
+      "title": "Stream network (lt_c_wkmstrm)",
+      "geometry": "Polygon",
+      "typename": "lt_c_wkmstrm",
+      "verified": true,
+      "supported": true,
+      "notes": "Stream network polygons."
+    },
+    {
+      "id": "vworld.lt_c_upisuq153",
+      "provider": "vworld",
+      "template": "wfs",
+      "title": "Urban planning facility - open space (lt_c_upisuq153)",
+      "geometry": "Polygon",
+      "typename": "lt_c_upisuq153",
+      "verified": true,
+      "supported": true,
+      "notes": "Parks, green space and plazas. Filter on the mls_nam attribute after loading. Some polygons are self-intersecting, so run a geometry fix before overlay analysis."
+    }
+  ]
+}

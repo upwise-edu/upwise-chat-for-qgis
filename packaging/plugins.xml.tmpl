@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  UPWISE Chat for QGIS - custom plugin repository feed (template).
+
+  Rendered by packaging/build_zip.py. Every double-brace token below is filled
+  from upwise_chat_for_qgis/metadata.txt, except file_name and download_url, which
+  are assembled from the built ZIP name and the hosting base URL constant in
+  build_zip.py. Do not hand-edit the rendered plugins.xml; edit metadata.txt or
+  this template and rebuild.
+
+  The field set is the core subset of the official plugins.qgis.org feed that a
+  custom repository needs. QGIS reads it after the repository URL is registered
+  in Plugins / Manage and Install Plugins / Settings / Add.
+-->
+<plugins>
+  <pyqgis_plugin name="{{name}}" version="{{version}}">
+    <description>{{description}}</description>
+    <about>{{about}}</about>
+    <qgis_minimum_version>{{qgis_minimum_version}}</qgis_minimum_version>
+    <qgis_maximum_version>{{qgis_maximum_version}}</qgis_maximum_version>
+    <homepage>{{homepage}}</homepage>
+    <file_name>{{file_name}}</file_name>
+    <icon>{{icon}}</icon>
+    <author_name>{{author_name}}</author_name>
+    <download_url>{{download_url}}</download_url>
+    <experimental>{{experimental}}</experimental>
+    <deprecated>{{deprecated}}</deprecated>
+    <repository>{{repository}}</repository>
+    <tracker>{{tracker}}</tracker>
+  </pyqgis_plugin>
+</plugins>

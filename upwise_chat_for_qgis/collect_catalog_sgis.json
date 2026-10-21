@@ -1,0 +1,128 @@
+{
+  "schema": 1,
+  "note": "SGIS (Statistics Korea SGIS OpenAPI3) provider definition and the two datasets whose request and response shapes are documented. Sources: the captured developer pages in docs/terms_snapshots_261011/sgis_api_data.txt (stats/population.json parameter and response tables) and docs/terms_snapshots_261012/sgis_openapi_map_html.html (boundary/hadmarea.geojson call example), plus the author's own working collector scripts/collect/collect_sgis.py. The data API guide for the rest of the SGIS endpoints could not be opened (docs/3 gate 4), so no other SGIS endpoint is listed here - an endpoint we have not read is not invented.",
+  "note_key_panel": "The key panel reads keystore.load_providers(), which merges this file with collect_registry.json and the other shipped catalogs in the same order the collect server uses (keystore.CATALOG_SIBLINGS mirrors collect_server.CATALOG_SIBLINGS, and harness 24 A11 asserts the two lists are equal). The panel renders multi field providers since 0.5.0, so this provider shows up from this file with one input box per providers.sgis.fields entry (widget objectName UpwiseChatKeyField_sgis__<field>), and it is configured only when every required field is filled. It needs no entry in collect_registry.json. The panel also lifts the join key trap out of the dataset notes below into the provider row tooltip, verbatim.",
+  "provider": "sgis",
+  "providers": {
+    "sgis": {
+      "title": "SGIS (Statistics Korea geographic information service)",
+      "signup": "https://sgis.mods.go.kr/developer/html/openApi/api/map.html",
+      "signup_note": "Developer guide page captured on 2026-10-11. The issuing page URL itself was not captured, so this points at the guide rather than at a page we have not read.",
+      "fields": [
+        {
+          "name": "service_id",
+          "label": "서비스 ID",
+          "setting": "upwise_chat/keys/sgis__service_id",
+          "required": true
+        },
+        {
+          "name": "security_key",
+          "label": "보안 Key",
+          "setting": "upwise_chat/keys/sgis__security_key",
+          "required": true
+        }
+      ],
+      "auth_endpoint": {
+        "url": "https://sgisapi.kostat.go.kr/OpenAPI3/auth/authentication.json",
+        "params": {
+          "service_id": "consumer_key",
+          "security_key": "consumer_secret"
+        },
+        "token_path": "result.accessToken",
+        "token_param": "accessToken",
+        "error": {
+          "code_path": "errMsg",
+          "ok": [
+            "Success"
+          ],
+          "msg_path": "errMsg"
+        }
+      },
+      "templates": {
+        "openapi3": {
+          "auth": "token",
+          "token_param": "accessToken",
+          "bbox_param": "",
+          "crs_param": "",
+          "max_features_param": "",
+          "paging": "none",
+          "page_limit": 1,
+          "format": "json",
+          "default_crs": "EPSG:5179",
+          "allowed_crs": [
+            "EPSG:5179"
+          ],
+          "params": {
+            "year": {
+              "type": "str",
+              "desc": "기준연도. 문서가 적은 값은 2000, 2005, 2010, 2015~2020 이고, 2023 은 저자 수집기가 실호출로 받아낸 값이다(2026-09-12 실측). 받는 값의 전체 목록은 문서에 없어 enum 으로 묶지 않는다."
+            },
+            "low_search": {
+              "type": "enum",
+              "enum": [
+                "0",
+                "1",
+                "2"
+              ],
+              "desc": "하위 행정구역 포함 단계. 0 은 해당 코드만, 1 은 한 단계 아래, 2 는 두 단계 아래다. 기본값은 1. 엔드포인트마다 뜻이 달라지는 자리이므로 데이터셋 notes 를 읽고 고른다."
+            },
+            "adm_cd": {
+              "type": "str",
+              "desc": "SGIS 행정구역코드. 비우면 전국 시도 목록이 온다. 2자리는 시도, 5자리는 시군구, 7자리는 읍면동이다. 행정표준코드가 아니다 - notes 참고."
+            }
+          },
+          "required": [
+            "year",
+            "low_search"
+          ],
+          "response": {
+            "error": {
+              "code_path": "errMsg",
+              "ok": [
+                "Success"
+              ],
+              "msg_path": "errMsg"
+            }
+          }
+        }
+      }
+    }
+  },
+  "datasets": [
+    {
+      "id": "sgis.boundary_hadmarea",
+      "provider": "sgis",
+      "template": "openapi3",
+      "base_url": "https://sgisapi.kostat.go.kr/OpenAPI3/boundary/hadmarea.geojson",
+      "title": "행정구역 경계 (SGIS boundary/hadmarea)",
+      "geometry": "Polygon",
+      "format": "geojson",
+      "verified": false,
+      "supported": true,
+      "response": {
+        "kind": "geojson",
+        "items_path": "features",
+        "crs": "EPSG:5179"
+      },
+      "notes": "좌표계는 SGIS 기본값인 EPSG:5179 (UTM-K) 로 온다. 서버는 재투영하지 않는다. [함정 1] low_search 의 뜻이 엔드포인트마다 다르다. 경계(hadmarea)는 adm_cd 없이 부르면 0, 1, 2 가 모두 시도 17개를 돌려주지만, 인구(sgis.stats_population)는 '0' 이면 전국 합계 2행만 온다(2026-09-12 실측). 두 데이터셋을 조인할 생각이면 low_search 를 '1' 로 통일한다. [함정 2] SGIS adm_cd 는 행정표준코드가 아니다. 광주광역시가 24 이고 행정표준코드 29 가 아니다. V-World lt_c_adsigg 의 sig_cd 와 직접 조인하면 틀린 결과가 조용히 나온다 - 조인 전에 코드 체계를 맞춰야 한다."
+    },
+    {
+      "id": "sgis.stats_population",
+      "provider": "sgis",
+      "template": "openapi3",
+      "base_url": "https://sgisapi.kostat.go.kr/OpenAPI3/stats/population.json",
+      "title": "인구주택총조사 주요지표 (SGIS stats/population)",
+      "geometry": "",
+      "format": "json",
+      "default_crs": "",
+      "allowed_crs": [],
+      "verified": false,
+      "supported": true,
+      "response": {
+        "kind": "json_records",
+        "items_path": "result"
+      },
+      "notes": "공간 데이터가 아니다. 좌표가 없으므로 수집 결과는 records.csv 로 저장되고 layer_path 는 빈 문자열이다. [함정 1] low_search 를 '0' 으로 두면 전국 합계 2행만 오고 adm_cd 가 비어 있다(2026-09-12 실측). 시도 17행을 받으려면 '1' 이어야 하고, 경계(sgis.boundary_hadmarea)와 조인할 때도 양쪽을 '1' 로 맞춘다. [함정 2] SGIS adm_cd 는 행정표준코드가 아니다. 광주광역시가 24 이고 행정표준코드 29 가 아니다. V-World lt_c_adsigg 의 sig_cd 와 직접 조인하면 틀린 결과가 조용히 나온다. 조인은 같은 SGIS adm_cd 끼리만 한다. 주요 응답 필드는 adm_cd, adm_nm, tot_ppltn, avg_age, ppltn_dnsty, tot_family, tot_house 다."
+    }
+  ]
+}
