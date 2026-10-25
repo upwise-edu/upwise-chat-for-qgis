@@ -355,6 +355,15 @@ class BackendAdapter(object):
     #: 대기 메시지 취소를 광고하는 런타임 능력 이름. 없으면 "".
     runtime_cap_cancel_queued = ""
 
+    #: 대기 메시지 1건을 **지금 보내기**(sendNow)를 광고하는 런타임 능력
+    #: 이름. 없으면 "".
+    #:
+    #: `runtime_cap_interrupt` 와 **다른 축이다.** 영수증 능력이 있어도
+    #: sendNow 플래그를 읽는 능력은 없을 수 있고(판본 추이 10 -> 11 -> 13 종
+    #: 에서 이름이 늘어난 것이 그 증거다), 그때 호출자는 plain interrupt
+    #: 뒤 전송 폴백으로 내려가야 한다.
+    runtime_cap_interrupt_send_now = ""
+
     #: 아는 system subtype 들. 이 목록 밖은 무시 + 기록이다(예외 금지).
     known_system_subtypes = ()
 

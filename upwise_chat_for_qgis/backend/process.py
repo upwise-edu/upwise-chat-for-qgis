@@ -786,6 +786,23 @@ class BackendProcess(QObject):
         return self._runtime_cap_live(
             getattr(self._backend, "runtime_cap_cancel_queued", ""))
 
+    def interrupt_send_now_live(self):
+        """대기 메시지 1건을 지금 보내는 요청을 보내도 되는가(0.6.1).
+
+        `interrupt_live()` 와 **다른 축이다.** 선언 플래그는 같은
+        `control_interrupt` 를 쓰지만 런타임 광고 이름이 다르다
+        (`interrupt_send_now_v1` 대 `interrupt_receipt_v1`) - 영수증은
+        광고하면서 sendNow 는 광고하지 않는 판본이 있을 수 있고, 그때
+        호출자는 plain interrupt 뒤 전송 폴백으로 내려가야 한다.
+
+        Returns:
+            bool
+        """
+        if not self._backend.capabilities.control_interrupt:
+            return False
+        return self._runtime_cap_live(
+            getattr(self._backend, "runtime_cap_interrupt_send_now", ""))
+
     def has_cli_capability(self, name):
         """세션 개시 이벤트가 이 런타임 능력을 광고했는가(0.6.1).
 
@@ -1176,6 +1193,57 @@ class BackendProcess(QObject):
         return self.send_control(self._backend.control_interrupt_subtype,
                                  reason=reason)
 
+    def interrupt_turn_send_now(self, message_uuid, reason=None):
+        """대기 메시지 1건을 **지금 보내 달라고** 요청한다(0.6.1).
+
+        `interrupt_turn()` 과 같은 subtype(`interrupt`)에 불리언 플래그
+        `send_now` 와 대상 `message_uuid` 를 더한 것이다. 요청 꼴은 하네스
+        107 r1 이 실제로 보낸 바이트와 **필드 집합이 같다** `[실측]`
+        (`{"subtype":"interrupt","send_now":true,"message_uuid":"..."}`;
+        녹화 outputs/queue_probe2_20261025_090338/r1/stdin.jsonl 3행).
+        `cancel_queued` 는 넣지 않는다 - 함께 주면 Stop 으로 처리된다
+        `[스키마]`(docs/10 2 절).
+
+        무엇을 지어내지 않았는가
+            `reason` 은 기본값 None 이고 그때 **키 자체가 안 들어간다.**
+            107 이 보낸 요청에 `reason` 이 없었고, 있을 때의 거동은
+            측정되지 않았다.
+
+        영수증 값의 뜻 (docs/10 2 절, CLI 번들 describe 발췌 r7.txt 9행)
+            `stopped`     돌던 턴을 중단했고 그 result 가 뒤따른다 `[실측]`
+                          (V50-02, 글만 쓰던 턴)
+            `delivering`  턴을 멈추지 않았다 - 돌던 턴이 없거나, 턴이 그
+                          메시지를 받아들이는 중이거나, CLI 가 턴이 기다리는
+                          작업을 백그라운드로 옮기는 중이거나, 이미 멈추는
+                          중이거나, 프로세스가 끝나는 중이다 `[스키마]`
+            `nothing_waiting`  보낼 대기 메시지가 없었다 `[스키마]`
+
+            **어느 분기를 타는지는 CLI 가 정한다.** 우리는 요청만 하고
+            영수증 값으로 안다 - 분기 조건을 우리가 판정하지 않는다.
+
+        Args:
+            message_uuid: 지금 보낼 대기 메시지의 uuid(우리가 발급한 값).
+            reason: 중단 사유 문자열. None 이면 키를 넣지 않는다.
+
+        Returns:
+            str: 발급한 request_id. 보내지 못했으면 빈 문자열.
+        """
+        if not message_uuid:
+            return ""
+        # 런타임 하향. 광고에 sendNow 이름이 없으면 보내지 않는다 - 그 판본이
+        # 모르는 플래그를 어떻게 읽는지 측정하지 않았다. 호출자는 이 빈
+        # 문자열을 보고 plain interrupt 폴백으로 내려간다.
+        if not self.interrupt_send_now_live():
+            if self.logbook is not None:
+                self.logbook.diag(
+                    "control_runtime_absent",
+                    getattr(self._backend, "runtime_cap_interrupt_send_now",
+                            ""))
+            return ""
+        return self.send_control(self._backend.control_interrupt_subtype,
+                                 send_now=True, message_uuid=message_uuid,
+                                 reason=reason)
+
     def cancel_queued_message(self, message_uuid):
         """대기 중인 메시지 1건을 취소한다(0.6.1).
 
@@ -1346,9 +1414,14 @@ class BackendProcess(QObject):
                                            ",".join(sorted(self.cli_capabilities))))
             # 하향된 축을 이름으로 적는다. 조용히 끄면 "왜 대기 표시가 없나"
             # 를 나중에 되짚을 수 없다.
+            # 0.6.1: sendNow 축이 넷째로 들어왔다. 축 이름이 곧
+            # `runtime_cap_<축>` 속성 이름이어야 아래 getattr 가 원하는 능력
+            # 이름을 찾는다(그래서 축 이름이 `interrupt_send_now` 다).
             for axis, live in (("queue_lifecycle", self.lifecycle_live()),
                                ("interrupt", self.interrupt_live()),
-                               ("cancel_queued", self.cancel_queued_live())):
+                               ("cancel_queued", self.cancel_queued_live()),
+                               ("interrupt_send_now",
+                                self.interrupt_send_now_live())):
                 if not live:
                     self.logbook.diag(
                         "runtime_capability_downgraded",

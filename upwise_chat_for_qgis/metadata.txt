@@ -4,7 +4,7 @@ qgisMinimumVersion=3.28
 qgisMaximumVersion=4.99
 description=Chat dock for QGIS backed by a long-lived Claude Code CLI session.
 about=A chat dock widget for QGIS. Reasoning and tool execution run in a separate long-lived Claude Code CLI process (stream-json in/out), so the plugin reuses an existing Claude Code installation and its existing authentication. Features streaming chat, a tool-use approval bar, skill preset buttons with prerequisite checks, per-cell and row-range copy, one-button Markdown export of the whole transcript (written to a fixed path under the QGIS profile), and UPWISE branding. Map control is built in as of 0.3.0: the plugin runs its own QGIS socket server on an ephemeral port and its own standard-library bridge, so there is no second QGIS plugin to install, no Run MCP button to press, and map control needs no uvx and no network fetch at run time. 78 QGIS tools are offered, the socket requires a per-session token, code and SQL execution tools are refused by the server itself, a tool result larger than 256 KB is cut at that limit with a hint to narrow the request, and the built-in connection check reports the port, the plugin version, the QGIS version and the layer count without spending a model turn. General-purpose public data collection runs in a plugin-owned server with a non-modal key settings panel in the dock, so API keys stay out of the model context and leave only in HTTP requests the plugin makes itself; the plugin sends them to no destination of its own beyond the provider API that a dataset declares, and the endpoint override field and a registered data.go.kr URL are yours to set. Three providers ship as of 0.5.0: V-World, which offers 158 datasets drawn from the official 2D data list, each listed with a verified flag, SGIS for administrative boundaries and population, and data.go.kr, whose APIs you register yourself from two presets because that portal publishes no machine-readable catalogue of them; it also approves each API separately. A result that carries no geometry is written as a table and loaded as a table layer. Once a key is stored, its value is redacted from what the plugin writes after that: the transcript, every clipboard write, the export, the session recording and the diagnostic log; the collection server masks the same values, and the access token it exchanges with SGIS, before it writes a response to disk or returns one. Requires the Claude Code CLI. Development and testing ran on Windows 10 and 11 with QGIS 3.44; Linux and macOS are untested, and one path, killing a stuck CLI process tree, is implemented for Windows only.
-version=0.6.0
+version=0.6.1
 author=UPWISE
 email=upwise0506@gmail.com
 repository=https://github.com/upwise-edu/upwise-chat-for-qgis
@@ -16,6 +16,7 @@ experimental=True
 deprecated=False
 hasProcessingProvider=False
 changelog=
+    0.6.1 Messages typed during a turn queue in the CLI; Esc stops the turn, Ctrl+Shift+Enter sends what waits now, and Up takes a queued message back, as in the Claude Code interactive session.
     0.6.0 The dock gains usage and collection charts and a bottom navigation, and data.go.kr offers a portal search link when a dataset list comes back empty.
     0.5.4 The header captions no longer run into each other.
     0.5.3 The theme and model dropdown lists are readable again.

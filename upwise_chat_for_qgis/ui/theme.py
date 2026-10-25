@@ -251,6 +251,18 @@ STATE_FAIL = "fail"
 # 중간값에 danger 계열을 쓸 수 없고, 주의 축의 색이 헤더 면에 이미 있다.
 STATE_WARN = "warn"
 
+# 다섯 번째 상태(0.6.1). 사용자 말풍선에만 쓴다 - "보냈지만 아직 모델이 그
+# 메시지에 답하기 시작하지 않았다" 를 흐린 면으로 말한다(Claude Code 대화형
+# 화면이 대기 메시지를 회색으로 보이는 것과 같은 뜻).
+#
+# **새 색을 만들지 않았다.** 이 값은 이미 측정된 `window_bg`(창 면)와
+# `muted_fg`(흐린 본문)로 그려진다. 평소 말풍선은 `user_bg`/`user_fg` 라 두
+# 상태가 면과 글자 둘 다에서 갈린다.
+#
+# `card_bg` 를 쓰지 않은 이유: **다크에서 `USER_BG_DARK = CARD_BG_DARK`** 라
+# 면이 평소 말풍선과 같아진다(하네스 106 T2 가 잡았다).
+STATE_QUEUED = "queued"
+
 # 전제조건 항목 심각도. detect 의 MISSING/UNKNOWN 을 UI 어휘로 옮긴 것이다.
 LEVEL_UNMET = "unmet"
 LEVEL_UNKNOWN = "unknown"

@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.6.1
+
+Typing while a turn runs. The dock now follows the Claude Code interactive
+session for messages sent during a turn: the send key queues, Esc stops,
+Ctrl+Shift+Enter sends what waits now, and Up on the first line takes a queued
+message back. The queue is the CLI's own command queue; the plugin keeps none
+of its own.
+
+- **Queueing is delegated to the CLI.** The dock used to refuse input while a
+  turn ran. It now stamps each user message with a uuid and writes it to the
+  CLI as it comes; the CLI's command queue holds it, and the
+  `command_lifecycle` events (queued, started, completed, cancelled) together
+  with `result.user_message_uuids` tell the dock what is still waiting. The
+  busy label reads the waiting count and a bar with that count appears only
+  while something waits. A queue inside the UI was considered and dropped once
+  a stream recording showed that the CLI already queues a message that
+  carries a uuid; our serializer had never sent one, which is why the queue
+  had never been seen.
+- **Stop: Esc, and the Cancel button.** The button used to kill the CLI
+  process tree and respawn it with `--resume`. It now sends a plain
+  `interrupt` control request: the turn stops, the process and the session
+  stay, the draft stays in the box, and queued messages are left in the CLI's
+  queue, where in our recordings they ran next, which is what the interactive
+  session does on Esc. The CLI schema names one window where an interrupt can
+  drop a queued message instead, before the first command of a session has
+  started; that window was not observed. Esc in the input box does the same
+  while a turn runs and is passed through otherwise.
+  The restart path remains as the fallback for a CLI that does not advertise
+  the interrupt capability, or when the request cannot be written.
+- **Send now: Ctrl+Shift+Enter.** The draft is queued first, then an
+  `interrupt` request with `send_now` naming the oldest waiting message goes
+  out. The CLI decides whether to stop the turn or to move the running work to
+  the background and deliver in the same turn, and says which in its receipt:
+  `stopped` has been observed on a text-only turn, `delivering` is handled
+  from the schema and has not yet been seen. Without the `send_now` capability
+  the dock falls back to a plain interrupt followed by the send after the
+  receipt arrives.
+- **Take back: Up on the first line, or the queue bar button.** Queued
+  messages are cancelled one uuid at a time with `cancel_async_message` and
+  their text is placed back in the input box, one per line, ahead of the
+  draft. Up falls through to command history when nothing waits. A message the
+  CLI had already started keeps running; its bubble is put back and a notice
+  says so.
+- **Dimmed bubbles.** A sent message is drawn muted until its `started`
+  lifecycle event arrives, so what Claude has not begun on is visible at a
+  glance. Contrast stays at or above 4.5 in both token sets, and the dock's
+  minimum width is unchanged.
+- **Measured against claude 2.1.310.** The behaviour above rests on stream
+  recordings: a plain interrupt leaves queued messages to run next;
+  `cancel_queued` cancels them and stops the turn; `send_now` returned
+  `stopped` on a text-only turn; an interrupt during a tool call produced a
+  synthetic user-rejected `tool_result` and `terminal_reason: aborted_tools`
+  with the session intact. Four things were not observed and are left open:
+  whether the CLI kills a child process the tool had spawned; whether a
+  queued message is delivered mid-turn at a tool boundary in stream-json
+  mode as the interactive session documents; the receipt values `delivering`
+  and `nothing_waiting`; and whether naming a message with `send_now` brings
+  it forward when two or more are waiting. With one message waiting, the
+  recorded `send_now` and a plain interrupt behaved alike: the turn stopped
+  and the waiting message ran next in both.
+
 ## 0.6.0
 
 A seam under the CLI session for a second backend, a portal search link where

@@ -950,11 +950,21 @@ class ChatView(QScrollArea):
         except Exception:  # noqa: BLE001 - 치환 실패가 전사를 비우게 하지 않는다
             return text
 
-    def add_user_message(self, text):
+    def add_user_message(self, text, dim=False):
         """사용자 말풍선. 전송 즉시 그린다(설계 4-2 user 행: replay 는 렌더 금지).
 
         0.2.1: 사용자가 키를 입력창에 붙여 넣은 경로가 여기로 들어온다 -
         레다크션이 가장 먼저 걸려야 하는 행이다(설계 docs/2 5-4 의 전제).
+
+        Args:
+            text: 본문 원문. 레다크터를 통과시킨다.
+            dim: 흐린 상태로 그릴 것인가(0.6.1). True 면 "보냈지만 아직
+                모델이 답하기 시작하지 않았다" 는 뜻의 면을 받는다. 상태를
+                거두는 것은 `set_user_message_dim(label, False)` 다.
+
+        Returns:
+            QLabel: 만든 말풍선. 호출자가 들고 있다가 상태를 바꾸거나
+                걷어낼 수 있다.
         """
         # 0.2.3: 복사와 내보내기가 담을 글은 앞머리 없는 본문이다. 화면에는
         # "나: " 를 붙여 두고 복사본에는 넣지 않는다 - 역할은 내보낸 글의
@@ -969,9 +979,69 @@ class ChatView(QScrollArea):
         # 한다. 사용자 입력이 들어오는 행이라 가장 자주 걸리는 자리다.
         label.setMinimumWidth(WRAP_LABEL_MIN_W)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        if dim:
+            # 0.6.1: 상태 속성 하나로 qss 가 흐린 면을 건다. 색을 여기서
+            # 만들지 않는다(그러면 테마 두 벌을 코드가 또 들어야 한다).
+            theme_mod.set_state(label, theme_mod.STATE_QUEUED)
         self._append_row("user", None, label, text_getter=lambda: body,
                          body_text=body)
         return label
+
+    def set_user_message_dim(self, label, dim):
+        """사용자 말풍선의 흐림 상태를 바꾼다(0.6.1).
+
+        `add_user_message(dim=True)` 로 그린 말풍선을 보통 상태로 돌리는
+        창구다. 흐림을 거두는 조건은 "그 메시지의 lifecycle `started` 를
+        봤다" 또는 "result 가 그 uuid 를 이름으로 불렀다" 이고, 그 판정은
+        독이 한다 - 전사는 색만 안다.
+
+        Args:
+            label: `add_user_message` 가 돌려준 라벨.
+            dim: True 면 흐리게, False 면 보통.
+
+        Returns:
+            bool: 상태를 적용했는가. 라벨이 없거나 이미 버려졌으면 False.
+        """
+        if label is None:
+            return False
+        try:
+            theme_mod.set_state(
+                label, theme_mod.STATE_QUEUED if dim else "")
+        except RuntimeError:
+            # 이미 deleteLater 로 걷힌 라벨이다. 전사를 멈추지 않는다.
+            return False
+        return True
+
+    def remove_user_message(self, label):
+        """사용자 말풍선 하나를 전사에서 걷어낸다(0.6.1 회수).
+
+        왜 필요한가
+            대기 메시지를 입력창으로 회수하면 그 메시지는 "보낸 것" 이
+            아니게 된다. Claude Code 대화형 화면도 회수한 메시지를 목록에서
+            지운다. 말풍선을 남겨 두면 보내지 않은 글이 보낸 것으로 남는다.
+
+        범위 선택은 푼다 - 행 인덱스가 밀리므로 잡혀 있던 밴드가 엉뚱한 행을
+        가리킨다(`_enforce_cap` 과 같은 근거).
+
+        Args:
+            label: `add_user_message` 가 돌려준 라벨.
+
+        Returns:
+            bool: 걷어냈는가. 그 라벨의 행이 없으면 False.
+        """
+        if label is None:
+            return False
+        target = None
+        for row in self._rows:
+            if row.get("widget") is label:
+                target = row
+                break
+        if target is None:
+            return False
+        self._rows = [row for row in self._rows if row is not target]
+        self._drop_row(target)
+        self._clear_range()
+        return True
 
     def add_notice(self, text):
         """로컬 공지. 백엔드 종료, 취소 마감 같은 플러그인 쪽 사실을 적는다."""

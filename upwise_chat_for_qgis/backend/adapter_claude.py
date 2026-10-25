@@ -100,6 +100,15 @@ CLAUDE_CAP_INTERRUPT_RECEIPT = "interrupt_receipt_v1"
 # 모른 채 과금 경로에 들어간다.
 CLAUDE_CAP_CANCEL_QUEUED = "interrupt_cancel_queued_v1"
 
+# sendNow 축의 광고 이름. 실측 13종 목록에 그대로 있다 `[실측]`
+# (docs/10 8 절). 요청 꼴과 영수증 값 `stopped` 도 실측이다
+# (docs/10 2 절, 하네스 107 r1 = outputs/queue_probe2_20261025_090338/r1).
+#
+# **영수증 값 3종 중 `stopped` 만 실측이고 `delivering`·`nothing_waiting` 은
+# `[스키마]` 다.** 그래서 호출자는 `stopped` 만 "턴이 멈췄다" 로 읽고 나머지
+# 값은 "멈추지 않았다" 로만 읽는다 - 값마다 다른 처분을 지어내지 않는다.
+CLAUDE_CAP_INTERRUPT_SEND_NOW = "interrupt_send_now_v1"
+
 
 class ClaudeAdapter(adapter.BackendAdapter):
     """Claude Code CLI 백엔드.
@@ -263,6 +272,7 @@ class ClaudeAdapter(adapter.BackendAdapter):
     runtime_cap_queue_lifecycle = CLAUDE_CAP_MSG_LIFECYCLE
     runtime_cap_interrupt = CLAUDE_CAP_INTERRUPT_RECEIPT
     runtime_cap_cancel_queued = CLAUDE_CAP_CANCEL_QUEUED
+    runtime_cap_interrupt_send_now = CLAUDE_CAP_INTERRUPT_SEND_NOW
 
     def serialize_control_request(self, request_id, subtype, **fields):
         """stream-json 의 control_request 한 줄(0.6.1 실관측 축자).
