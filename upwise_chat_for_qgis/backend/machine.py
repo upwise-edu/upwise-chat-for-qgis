@@ -221,7 +221,7 @@ class Turn(object):
     __slots__ = ("turn_no", "started_ts", "ended_ts", "blocks", "block_index",
                  "cards", "card_order", "denials", "exclusions", "is_error",
                  "result_text", "closed_by", "interrupted", "replay_text",
-                 "desync", "thinking_tokens")
+                 "desync", "thinking_tokens", "user_message_uuids")
 
     def __init__(self, turn_no, started_ts):
         self.turn_no = turn_no
@@ -242,6 +242,9 @@ class Turn(object):
         self.replay_text = ""
         self.desync = ""
         self.thinking_tokens = 0
+        # 이 턴을 닫은 result 가 실어 온 `user_message_uuids`(0.6.1).
+        # 턴과 메시지를 1:1 로 짝지어 주는 실관측 필드다.
+        self.user_message_uuids = []
 
     def open_cards(self):
         """아직 결과가 안 온 카드 목록."""
@@ -363,6 +366,42 @@ class TurnMachine(object):
         self.last_event_ts = None
         self.lines_seen = 0
 
+        # ----- 0.6.1 큐 수명과 제어 응답 -----
+
+        # command_uuid -> 마지막 state. `completed`/`cancelled` 에서 지운다.
+        # **대기 건수의 원천이다.** `result.queued_turn_count` 는 쓰지 않는다
+        # (실관측: B 가 대기 중인 시점의 result 도 0 이었다. 그 필드로 그리면
+        # 영구 0 이다).
+        self.lifecycle = {}
+        self.lifecycle_events = 0
+
+        # 우리가 발급한 메시지 uuid 집합. 재방출 user 줄이 우리 것인지
+        # 가르는 유일한 기준이다. **비어 있으면 판정을 하지 않는다** -
+        # 등록이 없는 재생에서 모든 줄을 CLI 생성분으로 몰면 전사가 빈다.
+        #
+        # **재spawn 에서 비우지 않는다.** 재개(`--resume`)는 이전 세션의
+        # 메시지를 다시 방출할 수 있고, 그때 집합을 비웠으면 우리가 보낸
+        # 메시지가 CLI 생성분으로 잘못 분류된다. 집합이 커지는 쪽이 안전한
+        # 방향이다(세션 1개의 메시지 수는 수백 단위다).
+        self._issued_uuids = set()
+        self._expected_user_uuid = None
+
+        # 우리가 보낸 제어 요청. request_id -> subtype.
+        self._our_control_ids = {}
+        self.control_responses = []
+        self.unmatched_control_responses = []
+
+        # 우리 interrupt 의 응답을 받았는가. 이 사실만이 "중단 직후" 의
+        # 근거다(추측 금지). 중단된 턴 1개를 분류하면 내려간다.
+        self._interrupt_ack_open = False
+        self.interrupt_acks = 0
+        self.interrupted_turns = 0
+
+        # uuid 가 우리 발급 집합에 없는 재방출 user 줄. CLI 생성분이다
+        # (실관측: interrupt 직후 `[Request interrupted by user]` 가 CLI
+        # 자기 uuid 로 온다). 분류만 하고 렌더는 UI 단계가 정한다.
+        self.synthetic_user_lines = []
+
     # ------------------------------------------------------------------
     # 진단
     # ------------------------------------------------------------------
@@ -387,14 +426,50 @@ class TurnMachine(object):
         """spawn 직후. init 을 기다린다."""
         self.state = STARTING
 
-    def note_sent(self, text):
+    def note_sent(self, text, uuid=None):
         """사용자 줄을 stdin 에 넣은 직후(설계 4-1 SENT).
 
         replay 로 돌아오는 텍스트와 비교하기 위해 보낸 값을 기억한다.
+
+        Args:
+            text: 보낸 원문.
+            uuid: 그 줄에 붙인 클라이언트 식별자(0.6.1). None 이면 0.6.0
+                과 동작이 같다 - 합성 user 줄 판별과 uuid 짝짓기만 꺼진다.
         """
         self._expected_user_text = text
+        self._expected_user_uuid = uuid
+        if uuid:
+            self.note_issued_uuid(uuid)
         self.state = SENT
         self._start_turn(reason="sent")
+
+    def note_issued_uuid(self, uuid):
+        """우리가 발급한 메시지 uuid 를 등록한다(0.6.1).
+
+        `note_sent` 와 따로 두는 이유
+            녹화본 재생에는 `note_sent` 가 없다(턴을 임의로 열면 전사가
+            달라진다). 그래도 "어느 uuid 가 우리 것인가" 는 알아야 합성
+            user 줄을 가를 수 있으므로, 턴을 열지 않는 등록 창구가 필요하다.
+
+        Args:
+            uuid: 등록할 식별자. 빈 값이면 아무것도 하지 않는다.
+        """
+        if uuid:
+            self._issued_uuids.add(uuid)
+
+    def note_control_sent(self, request_id, subtype):
+        """우리가 보낸 제어 요청을 등록한다(0.6.1).
+
+        등록하지 않은 request_id 의 응답은 짝 없는 응답으로 분류된다.
+        중단 판정의 근거가 **우리 요청의 응답 수신 사실**이므로, 이 등록이
+        없으면 중단된 턴을 중단으로 분류하지 않는다(추측하지 않는다).
+
+        Args:
+            request_id: 발급한 식별자.
+            subtype: 요청 종류.
+        """
+        if request_id:
+            self._our_control_ids[request_id] = subtype
 
     def note_cancelled(self):
         """사용자 취소. 열린 턴을 "취소됨" 으로 마감한다(설계 2-5).
@@ -417,6 +492,7 @@ class TurnMachine(object):
             self.note("turn_cancelled", "turn=%d" % turn_no)
         self.current_turn = None
         self._expected_user_text = None
+        self._expected_user_uuid = None
         self.state = RESTARTING
         return turn_no
 
@@ -482,6 +558,10 @@ class TurnMachine(object):
             self._on_result(parsed)
         elif kind == protocol.KIND_RATE_LIMIT:
             self._on_rate_limit(parsed)
+        elif kind == protocol.KIND_LIFECYCLE:
+            self._on_lifecycle(parsed)
+        elif kind == protocol.KIND_CONTROL_RESPONSE:
+            self._on_control_response(parsed)
         elif kind == protocol.KIND_NONJSON:
             # 무시 + 로그(설계 4-2 마지막 행들).
             self.nonjson_count += 1
@@ -600,7 +680,14 @@ class TurnMachine(object):
             if block.btype == "tool_result":
                 self._on_tool_result(parsed, block)
             elif block.btype in ("text", "thinking"):
-                self._on_replay(parsed, block)
+                # 0.6.1: uuid 가 우리 발급 집합에 없으면 CLI 생성분이다.
+                # 집합이 비어 있으면(등록 없는 경로) 판정하지 않는다 -
+                # 그때 전부 CLI 생성분으로 몰면 전사가 빈다.
+                if (self._issued_uuids and parsed.uuid
+                        and parsed.uuid not in self._issued_uuids):
+                    self._on_synthetic_user(parsed, block)
+                else:
+                    self._on_replay(parsed, block)
             else:
                 self._bump("user_block/" + (block.btype or "(none)"))
                 self.note("user_block_unknown", block.btype or "(none)")
@@ -625,6 +712,21 @@ class TurnMachine(object):
             self.note("replay_no_expectation", "len=%d" % len(block.text or ""))
         if self.state in (SENT, READY, DONE):
             self.state = RUNNING
+
+    def _on_synthetic_user(self, parsed, block):
+        """CLI 가 스스로 방출한 user 줄(0.6.1 실관측).
+
+        interrupt 직후 CLI 가 `[Request interrupted by user]` 를 **자기
+        uuid** 로 내보낸다. 우리 발급 집합에 없는 uuid 가 그 식별자다
+        (문구로 가르지 않는다 - 문구는 바뀌고 uuid 규약은 바뀌지 않는다).
+
+        여기서는 **분류만** 한다. 사용자 말풍선으로 섞이지 않게 재방출
+        경로에서 빼 두고, 어떻게 보일지는 UI 단계가 정한다.
+        """
+        self._bump("user/synthetic")
+        self.synthetic_user_lines.append((parsed.uuid, block.text or ""))
+        self.note("synthetic_user_line",
+                  "uuid=%s text=%r" % (parsed.uuid[:12], (block.text or "")[:80]))
 
     def _on_tool_result(self, parsed, block):
         """열린 도구 카드에 결과를 접어 넣는다(설계 4-2, 4-3).
@@ -853,6 +955,36 @@ class TurnMachine(object):
         turn.result_text = text if isinstance(text, str) else ""
         turn.ended_ts = parsed.ts
         turn.closed_by = "result"
+        # 0.6.1: 턴과 메시지를 uuid 로 짝짓는다. 기존 텍스트 기반 짝짓기
+        # (`_expected_user_text` / desync)를 **대체하지 않고 병행**한다 -
+        # 텍스트 축은 재방출 왕복을 재고 이 축은 result 와 메시지를 잇는다.
+        turn.user_message_uuids = self._result_message_uuids(ev)
+        # 0.6.1 V47-A03: 이 턴이 실어 온 uuid 를 미결 집합에서 정산한다.
+        # 프로세스 계층의 `_settle_by_result` 와 **같은 처방이고 대상만
+        # 다르다** - 그쪽은 입력 게이트(`is_busy`)의 원천을, 이쪽은 UI
+        # "대기 N건" 의 원천을 든다. 한쪽만 정산하면 입력은 열렸는데 대기
+        # 바가 영구히 1 을 가리키는 어긋난 상태가 난다.
+        self._settle_lifecycle_by_result(turn.user_message_uuids)
+        if self._expected_user_uuid is not None:
+            if self._expected_user_uuid not in turn.user_message_uuids:
+                msg = ("sent_uuid=%s result_uuids=%s"
+                       % (self._expected_user_uuid[:12],
+                          [u[:12] for u in turn.user_message_uuids]))
+                self.desync_warnings.append(msg)
+                self.note("uuid_desync", msg)
+            self._expected_user_uuid = None
+        # 중단된 턴을 백엔드 사망으로 오판하지 않는다(실관측: 그 뒤 새
+        # spawn 없이 같은 프로세스가 다음 메시지를 정상 처리했다).
+        if self._is_interrupted_result(ev):
+            turn.interrupted = True
+            turn.closed_by = "interrupted"
+            self.interrupted_turns += 1
+            # 창을 닫는다. interrupt 1발이 턴 1개를 중단시킨다.
+            self._interrupt_ack_open = False
+            self.note("turn_interrupted",
+                      "turn=%d subtype=%s is_error=%s acks=%d"
+                      % (turn.turn_no, ev.get("subtype"), turn.is_error,
+                         self.interrupt_acks))
         # DONE 은 순간 상태다(설계 4-1 의 DONE(result) -> READY). 상태값으로
         # 머물지 않고, 닫힌 턴은 last_closed_turn 으로 조회한다. UI 가 "완료"
         # 표시를 할 재료는 턴 객체에 다 있다.
@@ -862,11 +994,188 @@ class TurnMachine(object):
             turn.turn_no, turn.is_error, len(turn.denials)))
         self.current_turn = None
         self._expected_user_text = None
+        self._expected_user_uuid = None
         # 거부 바는 턴이 닫혀도 사용자가 누를 때까지 남는다(설계 3-5). 다만
         # 거부가 없던 턴이 끝났으면 오버레이를 내린다.
         if not turn.denials:
             self.awaiting_approval = False
         self.state = READY
+
+    # ------------------------------------------------------------------
+    # 큐 수명과 제어 응답 (0.6.1)
+    # ------------------------------------------------------------------
+
+    def _on_lifecycle(self, parsed):
+        """큐 수명 이벤트 1건으로 uuid 별 상태를 갱신한다.
+
+        제거 키는 `command_uuid`(우리가 붙인 메시지 uuid)다. 줄 자신의
+        `uuid` 로 지우면 들어온 적 없는 키를 지우는 것이라 집합이 영원히
+        비지 않는다.
+
+        `completed`/`cancelled` 만 제거다. 번들 스키마의 `discarded`·
+        `refused` 는 관측되지 않았으므로 제거 조건에 넣지 않는다 - 관측
+        없이 넓히면 아직 살아 있는 메시지를 끝난 것으로 지운다.
+        """
+        info = parsed.info
+        if info is None:
+            return
+        self.lifecycle_events += 1
+        self._bump("lifecycle/" + (info.state or "(none)"))
+        if not info.command_uuid:
+            self.note("lifecycle_without_command_uuid", parsed.raw[:120])
+            return
+        if info.state in (protocol.LIFECYCLE_COMPLETED,
+                          protocol.LIFECYCLE_CANCELLED):
+            self.lifecycle.pop(info.command_uuid, None)
+        else:
+            self.lifecycle[info.command_uuid] = info.state
+            if info.state not in protocol.KNOWN_LIFECYCLE_STATES:
+                self.note("lifecycle_unknown_state", str(info.state))
+        self.note("lifecycle",
+                  "state=%s cmd=%s queued=%d outstanding=%d"
+                  % (info.state, info.command_uuid[:12],
+                     len(self.lifecycle), self.outstanding_count()))
+
+    def _on_control_response(self, parsed):
+        """제어 응답을 request_id 로 우리 요청과 짝짓는다.
+
+        짝이 없는 응답을 버리지 않는다 - CLI 가 originate 하는 요청의
+        응답이 섞여 올 수 있고, 이 단계는 답하지 않되 관측은 남긴다.
+
+        우리 interrupt 의 응답이면 "중단 직후" 창을 연다. 그 창이 중단된
+        턴을 백엔드 결함과 가르는 유일한 근거다(추측하지 않는다).
+        """
+        info = parsed.info
+        if info is None:
+            return
+        self._bump("control_response/" + (info.subtype or "(none)"))
+        matched = self._our_control_ids.pop(info.request_id, "")
+        self.control_responses.append((info.request_id, info.subtype,
+                                       dict(info.payload), matched))
+        if not matched:
+            self.unmatched_control_responses.append(
+                (info.request_id, info.subtype))
+            self.note("control_response_unmatched",
+                      "request_id=%s subtype=%s"
+                      % (info.request_id or "(none)", info.subtype or "(none)"))
+            return
+        if matched == self._backend.control_interrupt_subtype:
+            self._interrupt_ack_open = True
+            self.interrupt_acks += 1
+        self.note("control_response",
+                  "request_id=%s subtype=%s kind=%s payload_keys=%s"
+                  % (info.request_id, info.subtype or "(none)", matched,
+                     ",".join(sorted(info.payload))))
+
+    def queued_uuids(self):
+        """아직 시작되지 않은(대기 중인) 메시지 uuid 들.
+
+        UI 의 "대기 N건" 이 읽을 값이다.
+
+        Returns:
+            tuple: 수신 순서.
+        """
+        return tuple(k for k, v in self.lifecycle.items()
+                     if v == protocol.LIFECYCLE_QUEUED)
+
+    def running_uuids(self):
+        """지금 실행 중인(started) 메시지 uuid 들.
+
+        Returns:
+            tuple
+        """
+        return tuple(k for k, v in self.lifecycle.items()
+                     if v == protocol.LIFECYCLE_STARTED)
+
+    def outstanding_count(self):
+        """대기 건수. **`result.queued_turn_count` 와 다른 축이다.**
+
+        세는 것은 `queued` 상태의 메시지 수 하나다(= `len(queued_uuids())`).
+        실행 중인 것(`started`)은 세지 않는다 - UI 가 그리는 숫자는 "내
+        차례를 기다리는 것이 몇 건인가" 이고, 실행 중인 메시지는 이미
+        전사에 그려지고 있다. 실행 중인 것까지 보려면 `running_uuids()` 를
+        같이 읽는다.
+
+        Returns:
+            int
+        """
+        return len(self.queued_uuids())
+
+    def _result_message_uuids(self, ev):
+        """result 가 실어 온 메시지 uuid 목록(0.6.1 실관측).
+
+        복수형 필드가 권위다. 단수 필드도 같이 오지만(관측값 동일) 큐
+        실행에서 복수형이 1건씩 들어온 것이 짝짓기의 근거였다.
+
+        Returns:
+            list[str]: 없으면 빈 리스트.
+        """
+        got = ev.get("user_message_uuids")
+        if isinstance(got, (list, tuple)):
+            return [u for u in got if isinstance(u, str)]
+        one = ev.get("user_message_uuid")
+        return [one] if isinstance(one, str) and one else []
+
+    def _settle_lifecycle_by_result(self, message_uuids):
+        """result 가 이름을 부른 uuid 를 미결 집합에서 지운다(V47-A03).
+
+        왜 필요한가
+            집합은 `completed`/`cancelled` 로만 빈다. 번들에
+            `detachedToolCall: true` 와 "the turn can take them in as any
+            turn does" 가 있어 **큐의 메시지가 한 턴에 접힐 수 있고**
+            `[스키마]`, 접힌 uuid 에 종결 이벤트가 오지 않으면 그 uuid 가
+            영구히 남아 "대기 N건" 이 내려가지 않는다.
+            `result.user_message_uuids` 는 녹화 네 회차에서 1:1 이었고
+            `[실측]`, 접힘이 일어나면 흡수한 턴의 그 필드에 여러 uuid 가
+            실릴 자리다(docs/10 6 절).
+
+        지우는 범위
+            **result 가 이름을 부른 uuid 뿐이다.** 이름 없는 uuid 는
+            손대지 않는다 - 그것이 아직 실행 중일 가능성을 우리는 배제할
+            수 없다.
+
+        Args:
+            message_uuids: 이 result 의 `user_message_uuids`.
+
+        Returns:
+            int: 정산한 건수.
+        """
+        settled = []
+        for msg_uuid in message_uuids or ():
+            if self.lifecycle.pop(msg_uuid, None) is not None:
+                settled.append(msg_uuid)
+        if settled:
+            self.note("settled_by_result",
+                      "n=%d uuids=%s outstanding=%d"
+                      % (len(settled),
+                         ",".join(u[:12] for u in settled),
+                         self.outstanding_count()))
+        return len(settled)
+
+    def _is_interrupted_result(self, ev):
+        """이 result 가 "우리가 중단시킨 턴" 인가(0.6.1).
+
+        네 조건을 **모두** 본다.
+
+            1. 우리가 보낸 interrupt 의 응답을 받았다(`_interrupt_ack_open`)
+            2. subtype 이 중단 subtype 이다
+            3. `is_error` 가 참이다
+            4. `result` 본문이 없다(키 부재 또는 None - 실관측은 키 부재)
+
+        1 이 없으면 **판정하지 않는다.** 같은 모양의 result 가 다른 이유로
+        날 수 있고, 그것을 중단으로 적으면 진짜 오류를 숨긴다. "직후" 를
+        시간으로 재지 않는 이유도 같다 - 추측 대신 영수증을 쓴다.
+
+        Returns:
+            bool
+        """
+        if not self._interrupt_ack_open:
+            return False
+        if (ev.get("subtype") or "") != protocol.RESULT_SUBTYPE_ABORTED:
+            return False
+        if not ev.get("is_error"):
+            return False
+        return ev.get("result") is None
 
     def _on_rate_limit(self, parsed):
         """평시 무시, 신호가 있을 때만 경고 한 줄(설계 4-2)."""
@@ -989,4 +1298,13 @@ class TurnMachine(object):
             "rate_limit_warnings": len(self.rate_limit_warnings),
             "desync": len(self.desync_warnings),
             "drift": list(self.drift),
+            # 0.6.1. 키를 더하기만 한다 - 기존 키를 읽는 하네스는 그대로다.
+            "lifecycle_events": self.lifecycle_events,
+            "queued": self.outstanding_count(),
+            "running": len(self.running_uuids()),
+            "turns_interrupted": self.interrupted_turns,
+            "interrupt_acks": self.interrupt_acks,
+            "control_responses": len(self.control_responses),
+            "control_responses_unmatched": len(self.unmatched_control_responses),
+            "synthetic_user_lines": len(self.synthetic_user_lines),
         }

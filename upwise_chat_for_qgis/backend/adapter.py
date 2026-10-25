@@ -53,13 +53,17 @@ class BackendCapabilities(object):
         "tool_allowlist_flags",
         "per_call_mcp_config",
         "login_guard",
+        # 0.6.1 에 늘어난 두 축. 기본값만 False 다 - 아래 Args 참고.
+        "queue_lifecycle",
+        "control_interrupt",
     )
 
     def __init__(self, long_lived=True, partial_deltas=True,
                  preassigned_session_id=True, resume=True,
                  system_prompt_flag=True, plugin_dirs=True,
                  skill_bundle=True, tool_allowlist_flags=True,
-                 per_call_mcp_config=True, login_guard=True):
+                 per_call_mcp_config=True, login_guard=True,
+                 queue_lifecycle=False, control_interrupt=False):
         """능력 플래그를 굳혀 둔다.
 
         Args:
@@ -79,6 +83,22 @@ class BackendCapabilities(object):
             tool_allowlist_flags: 도구 단위 노출·사전승인·제외 플래그가 있다.
             per_call_mcp_config: 1회 호출 한정 MCP 설정 주입이 가능하다.
             login_guard: 미로그인 가드 3종(A·B·C)이 정의된다.
+            queue_lifecycle: 보낸 메시지에 클라이언트 uuid 를 붙이면 CLI 가
+                자기 큐의 수명 이벤트를 되돌려 준다(0.6.1). True 일 때만
+                호출자가 uuid 를 발급하고 미결 집합을 센다. **기본값이
+                False 인 이유**: 이 두 축은 Claude Code 2.1.310 에서 실측된
+                것이고, 능력을 선언하지 않은 백엔드에서 켜면 호출자가 오지
+                않을 수명 이벤트를 기다린다 - 나머지 열 축과 달리 "없는 것이
+                안전한" 방향이다.
+            control_interrupt: `control_request` 로 턴 중단과 대기 메시지
+                취소를 보낼 수 있다(0.6.1). False 면 호출자는 기존 경로
+                (트리 종료 + 재개 재spawn)만 쓴다.
+
+        Note:
+            이 플래그는 "이 **어댑터**가 그 기능을 말할 줄 안다" 는 선언이고,
+            세션 개시 이벤트가 광고하는 런타임 능력 목록과는 다른 축이다.
+            섞으면 구 CLI 판본에서 선언만 True 인 상태로 기능을 쓴다.
+            런타임 축은 `process.BackendProcess.has_cli_capability` 가 쥔다.
         """
         self.long_lived = bool(long_lived)
         self.partial_deltas = bool(partial_deltas)
@@ -90,6 +110,8 @@ class BackendCapabilities(object):
         self.tool_allowlist_flags = bool(tool_allowlist_flags)
         self.per_call_mcp_config = bool(per_call_mcp_config)
         self.login_guard = bool(login_guard)
+        self.queue_lifecycle = bool(queue_lifecycle)
+        self.control_interrupt = bool(control_interrupt)
 
     def as_dict(self):
         """진단 로그와 하네스가 읽는 dict. 플래그 이름이 그대로 키다."""
@@ -265,11 +287,37 @@ class BackendAdapter(object):
         """
         return None
 
-    def serialize_user_input(self, text):
+    def serialize_user_input(self, text, uuid=None):
         """stdin 에 쓸 사용자 메시지 한 줄.
 
         `capabilities.long_lived` 가 False 인 백엔드는 이 값을 stdin 대신
         argv 프롬프트로 쓸 수 있다 - 그 판단은 어댑터 안에서 한다.
+
+        Args:
+            text: 사용자 입력 원문.
+            uuid: 이 메시지에 붙일 클라이언트 식별자(0.6.1). None 이면
+                **0.6.0 과 바이트 동일한 줄**을 돌려줘야 한다 - 앞 회차
+                하네스가 그 바이트로 포맷을 재고 있다. 값을 주면 CLI 가
+                그 uuid 로 큐 수명 이벤트와 result 짝짓기를 돌려준다.
+
+        Returns:
+            str: 개행을 포함하지 않는다. 호출자가 붙인다.
+        """
+        raise NotImplementedError
+
+    def serialize_control_request(self, request_id, subtype, **fields):
+        """stdin 에 쓸 제어 요청 한 줄(0.6.1).
+
+        `request_id` 는 **보내는 쪽이 정하고** 응답이 그 값을 반향한다.
+        그것이 응답 짝짓기의 유일한 키다(실관측).
+
+        Args:
+            request_id: 이 요청의 식별자.
+            subtype: 요청 종류. 실관측은 턴 중단과 대기 메시지 취소 둘이다.
+            **fields: 요청별 인자. **값이 None 인 인자는 키 자체를 넣지
+                않는다** - 선택 인자를 null 로 보내면 그 요청이 더 이상
+                "아무 인자 없는" 요청이 아니고, 측정은 인자 없는 형태로만
+                돌았다.
 
         Returns:
             str: 개행을 포함하지 않는다. 호출자가 붙인다.
@@ -279,6 +327,33 @@ class BackendAdapter(object):
     # ------------------------------------------------------------------
     # 프로토콜 (docs/7 2-10 경계 3)
     # ------------------------------------------------------------------
+
+    #: 턴 중단 제어 요청의 subtype 이름(0.6.1). 없으면 "".
+    #: 호출자가 이 문자열을 들지 않게 어댑터가 쥔다(docs/7 2-10 경계 6).
+    control_interrupt_subtype = ""
+
+    #: 대기 메시지 1건 취소 제어 요청의 subtype 이름(0.6.1). 없으면 "".
+    control_cancel_queued_subtype = ""
+
+    # ----- 런타임 능력 이름 (0.6.1, V47-A07) -----
+    #
+    # 선언 플래그(`capabilities.*`)와 **다른 축이다.** 선언은 "이 어댑터가
+    # 이 기능을 말할 줄 안다" 이고, 이 셋은 "세션 개시 이벤트가 그 기능을
+    # 광고했는지 볼 때 찾을 이름" 이다. 프로세스 계층이 리터럴을 들지
+    # 않게 어댑터가 쥔다(docs/7 2-10 경계 6).
+    #
+    # **빈 문자열은 "판정하지 않는다"** 다 - 그 이름을 모르는 백엔드에서
+    # 기능이 꺼지면 안 되므로, 비어 있으면 선언 플래그 단독 판정으로
+    # 되돌아간다. 하향 조정은 이름이 있고 광고에 없을 때만 일어난다.
+
+    #: 큐 수명 이벤트를 광고하는 런타임 능력 이름. 없으면 "".
+    runtime_cap_queue_lifecycle = ""
+
+    #: 턴 중단 영수증을 광고하는 런타임 능력 이름. 없으면 "".
+    runtime_cap_interrupt = ""
+
+    #: 대기 메시지 취소를 광고하는 런타임 능력 이름. 없으면 "".
+    runtime_cap_cancel_queued = ""
 
     #: 아는 system subtype 들. 이 목록 밖은 무시 + 기록이다(예외 금지).
     known_system_subtypes = ()

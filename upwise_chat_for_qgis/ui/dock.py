@@ -628,6 +628,64 @@ STDERR_TAIL_MAX = 200
 BUSY_TEXT = "응답 받는 중%s"
 BUSY_DOTS_MAX = 3
 
+# ----- 0.6.1 채팅 큐잉·끼어들기 UI 배선 -----
+#
+# UI 큐를 만들지 않는다. CLI 가 자기 큐를 들고 있고(실측), 턴 중 stdin 에 쓰면
+# CLI 가 쌓아 두고 턴이 끝나면 **스스로** 다음 턴으로 실행한다. 그래서 여기에
+# 타이머·대기 리스트·재전송 루프가 없다 - 있으면 같은 메시지를 두 번 보낸다.
+
+# 대기 건수 꼬리. `busy_label` 한 라벨이 "도는 중" 과 "대기 N건" 을 함께
+# 말한다. 새 상시 위젯을 더하지 않는 이유는 독 최소 폭이다 - 상시 줄에 글자
+# 위젯을 더할 때마다 최소 폭이 그 글자 폭만큼 오른다(README 5, BADGE_OK_FMT
+# 주석의 같은 실측).
+BUSY_QUEUE_SUFFIX = " (대기 %d건)"
+
+# 그 라벨의 최소 폭(px). 1 인 이유는 BADGE_LABEL_MIN_W 와 **같은 실측**이다.
+#
+# 0.6.1 첫 판에서 이 값을 안 박았고, 대기 꼬리가 붙은 문면("응답 받는 중...
+# (대기 99건)")의 라벨 최소 폭이 323 px 로 뛰어 독 최소 폭이 341 -> 530 px 가
+# 됐다(하네스 106 W2-busy_queue 실측, 임계 480 초과). QLabel 은 줄바꿈이
+# 없으면 최소 폭이 **글자 전체 폭**이라 문면이 길어질 때마다 독이 그만큼
+# 안 좁아진다.
+#
+# 1 로 박으면 좁은 독에서 꼬리가 잘린 채 보인다. 잘려도 정보가 사라지지
+# 않는 이유는 **대기 안내 바가 같은 숫자를 자기 줄에 적기 때문**이다(그쪽
+# 라벨은 줄바꿈이 있어 폭을 안 밀고, 그 줄은 대기가 있을 때만 뜬다).
+BUSY_LABEL_MIN_W = 1
+
+# 그 라벨의 툴팁. 턴 중 입력이 열렸다는 사실과 중단 단축키를 **폭 비용 0** 인
+# 자리에 적는다. 단축키 안내를 상시 라벨로 만들면 위와 같은 비용이 든다.
+BUSY_TIP = (
+    "턴이 도는 중에도 입력할 수 있습니다. 보낸 글은 CLI 큐에 쌓이고\n"
+    "이번 턴이 끝나면 다음 턴으로 자동 실행됩니다.\n"
+    "Ctrl+Shift+Enter 는 지금 턴을 중단하고 곧바로 보냅니다."
+)
+
+# 대기 안내 바. busy 이고 대기가 있을 때만 보인다 - 상시 위젯이 아니다.
+QUEUE_BAR_TEXT = (
+    "대기 %d건이 차례를 기다립니다. 이번 턴이 끝나면 자동으로 실행됩니다."
+)
+QUEUE_CANCEL_TEXT = "대기 취소"
+QUEUE_CANCEL_TIP = (
+    "대기 중인 메시지를 모두 취소합니다. 도는 중인 턴은 그대로 둡니다."
+)
+
+# 큐 전송 공지. 사용자가 턴 중에 보낸 글이 **지금 실행되는 것이 아니라는**
+# 사실을 그 자리에 적는다. 적지 않으면 응답이 안 온다고 읽는다.
+NOTICE_QUEUED = "메시지를 큐에 넣었습니다. 이번 턴이 끝나면 실행됩니다."
+
+# 끼어들기 공지 3종.
+#
+# 중단된 턴은 `error_during_execution`·`is_error=true`·`result=null` 로 오는데
+# **백엔드 오류가 아니다**(실측: 그 뒤 같은 프로세스가 다음 메시지를 정상
+# 처리했다). 그래서 오류 문면을 쓰지 않는다.
+NOTICE_INTERRUPTED = "턴을 중단했습니다."
+NOTICE_INTERRUPT_SENT = "턴 중단을 요청했습니다. 영수증을 받으면 보냅니다."
+NOTICE_INTERRUPT_UNSUPPORTED = (
+    "이 백엔드는 턴 중단을 지원하지 않습니다. [취소](백엔드 재시작)를 쓰세요."
+)
+NOTICE_QUEUE_CANCELLED = "대기 %d건을 취소 요청했습니다."
+
 BADGE_UNKNOWN = "권한 미확인"
 
 # 통과 배지 문면(0.4.2, 사용자 결정 2026-10-17).
@@ -1071,6 +1129,26 @@ class UpwiseChatDock(QDockWidget):
         self._elevate_count = 0
         # 진행 중 표시의 점 개수(0.2.2). 워치독 틱이 돌린다.
         self._busy_dots = 0
+
+        # ----- 0.6.1 끼어들기 상태 -----
+        #
+        # "중단 후 전송" 은 두 단계다. interrupt 를 보내고 **영수증을 받은
+        # 뒤에** 보낸다 - 시간으로 재지 않는다(추측 금지). 그 사이 보낼 글을
+        # 여기 들고 있는다. 빈 문자열이면 대기 중인 끼어들기가 없다.
+        self._interrupt_text = ""
+        # 우리가 보낸 interrupt 의 request_id. 영수증 짝짓기에 쓴다.
+        self._interrupt_request_id = ""
+        # 영수증을 받았는가. 제어 응답 콜백이 세우고, 드레인 끝에서 전송하며
+        # 내린다. **콜백에서 바로 보내지 않는 이유**: 콜백은 `_inspect` 안
+        # (배치 드레인 중)에서 불리고, 그 시점에 상태머신은 아직 그 배치를
+        # 먹지 않았다. 그 자리에서 보내면 턴 경계가 뒤집힌다.
+        self._interrupt_acked = False
+        # 끼어들기·대기취소 요청 수. 하네스가 읽는 창구다.
+        self._interrupt_requests = 0
+        self._queue_cancel_requests = 0
+        # "중단됨" 공지를 이미 적은 턴 번호. 턴당 한 번이다(미로그인 공지와
+        # 같은 근거 - 같은 턴을 다시 보고 또 적지 않는다).
+        self._interrupted_notice_turns = set()
         # U11 대화 지우기 확인 상태. 서 있으면 다음 누름이 실제로 비운다.
         # 위젯보다 먼저 세운다 - _update_controls 가 이 값을 읽는다.
         self._clear_armed = False
@@ -2364,6 +2442,12 @@ class UpwiseChatDock(QDockWidget):
         self.busy_label.setObjectName("UpwiseChatBusy")
         theme_mod.set_role(self.busy_label, theme_mod.ROLE_BUSY)
         self.busy_label.setVisible(False)
+        # 0.6.1: 턴 중 입력과 중단 단축키 안내는 이 툴팁 하나로 한다. 상시
+        # 위젯을 더하지 않는 이유는 BUSY_TIP 주석에 있다(폭 비용).
+        self.busy_label.setToolTip(BUSY_TIP)
+        # 0.6.1: 대기 꼬리가 독 최소 폭을 밀지 못하게 박는다
+        # (BUSY_LABEL_MIN_W 주석에 실측값이 있다).
+        self.busy_label.setMinimumWidth(BUSY_LABEL_MIN_W)
         row_layout.addWidget(self.busy_label)
         row_layout.addStretch(1)
 
@@ -2383,6 +2467,24 @@ class UpwiseChatDock(QDockWidget):
         self.cancel_button.clicked.connect(self.cancel)
         row_layout.addWidget(self.cancel_button)
         layout.addWidget(row)
+
+        # 대기 안내 바(0.6.1). busy 이고 대기가 있을 때만 보인다.
+        #
+        # **자기 줄에 둔다.** 전송·취소와 같은 줄에 버튼을 더하면 그 줄의 최소
+        # 폭이 글자 폭만큼 오르고(QPushButton 은 sizeHint 아래로 줄지 않는다),
+        # 임계 480 의 여유를 먹는다. 바는 build_bar 와 같은 두 줄 꼴이라 본문이
+        # 줄바꿈으로 접히고 버튼 하나만 폭을 정한다.
+        self.queue_row = QFrame(area)
+        self.queue_row.setObjectName("UpwiseChatQueueBar")
+        self.queue_row.setFrameShape(QFrame.NoFrame)
+        self.queue_label, (self.queue_cancel_button,) = \
+            build_bar(self.queue_row, [(QUEUE_CANCEL_TEXT, "")])
+        self.queue_cancel_button.setToolTip(QUEUE_CANCEL_TIP)
+        # clicked 는 bool 을 넘긴다. 슬롯을 직접 이으면 그 bool 이 첫 인자
+        # 자리에 들어간다(이 파일의 _on_send_clicked 와 같은 함정).
+        self.queue_cancel_button.clicked.connect(self._on_queue_cancel_clicked)
+        self.queue_row.setVisible(False)
+        layout.addWidget(self.queue_row)
 
         # cwd 인라인 편집 행(S5-3). 기본은 숨어 있고 cwd 표시를 누르면 열린다.
         # 대화상자를 띄우지 않으므로 떠 있는 동안에도 QGIS 조작이 된다.
@@ -2431,6 +2533,26 @@ class UpwiseChatDock(QDockWidget):
         self._send_shortcut_enter = QShortcut(QKeySequence("Ctrl+Enter"), self.input_edit)
         self._send_shortcut_enter.setContext(Qt.WidgetWithChildrenShortcut)
         self._send_shortcut_enter.activated.connect(self.send_message)
+
+        # Ctrl+Shift+Enter = "중단 후 전송"(0.6.1).
+        #
+        # 버튼이 아니라 단축키인 이유는 폭이다 - 단축키는 **폭 비용이 0** 이고,
+        # 상시 줄에 글자 버튼을 더하면 독 최소 폭이 그만큼 오른다. 아이콘
+        # 버튼도 안전하지 않다(isNull 아이콘이 글자 폭으로 폴백해 19 -> 178 px
+        # 가 된 선례가 있다).
+        #
+        # 기존 [취소] 의 뜻을 바꾸지 않는다. 그 버튼은 "백엔드 재시작" 이고
+        # 툴팁이 그렇게 명시한다 - 진짜 끼어들기로 바꾸는 것은 사용자 결정
+        # 대기 항목이라 이 회차는 **더하기만** 한다.
+        self._interrupt_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+Return"), self.input_edit)
+        self._interrupt_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._interrupt_shortcut.activated.connect(self._on_interrupt_shortcut)
+        self._interrupt_shortcut_enter = QShortcut(
+            QKeySequence("Ctrl+Shift+Enter"), self.input_edit)
+        self._interrupt_shortcut_enter.setContext(Qt.WidgetWithChildrenShortcut)
+        self._interrupt_shortcut_enter.activated.connect(
+            self._on_interrupt_shortcut)
         return area
 
     def _build_status(self, parent):
@@ -2477,6 +2599,16 @@ class UpwiseChatDock(QDockWidget):
         backend.stderr_line.connect(self._on_stderr)
         backend.backend_died.connect(self._on_died)
         backend.gate_result.connect(self._on_gate)
+        # 제어 응답 콜백(0.6.1). 시그널을 새로 만들지 않는 이유는 설계 2-6 과
+        # 같다(이벤트당 시그널 금지). `getattr` 로 받지 않고 바로 꽂는 이유는
+        # 이 속성이 제품 BackendProcess 의 계약이기 때문이다 - 없으면 배선이
+        # 끊긴 것이고 그것은 조용히 넘길 사실이 아니다. 단 하네스의 가짜
+        # 백엔드가 이 속성을 안 가질 수 있으므로 설정 자체는 막지 않는다.
+        try:
+            backend.on_control_response = self._on_control_response
+        except AttributeError:
+            # 속성을 못 받는 객체(슬롯 전용 가짜)다. 끼어들기만 못 쓴다.
+            self._on_machine_note("control_callback_unwired", "")
         self.machine.note_starting()
         self._update_controls()
         self._update_status()
@@ -2755,6 +2887,11 @@ class UpwiseChatDock(QDockWidget):
         # 안 비우면 새 세션의 턴 1 이 옛 세션 턴 1 의 "이미 알렸다" 를
         # 물려받아 조용히 넘어간다(0.4.0, 가드 B).
         self._login_notice_turns = set()
+        # 0.6.1: 큐·끼어들기 상태와 "중단됨" 공지 이력도 비운다. 턴 번호가
+        # 1 부터 다시 시작하므로 이력을 들고 가면 새 세션의 턴 1 이 옛 턴 1 의
+        # "이미 적었다" 를 물려받는다(위 미로그인 공지와 같은 근거).
+        self._reset_queue_state()
+        self._interrupted_notice_turns = set()
         # soft 안내도 다시 판정한다(가드 A). 하드 공지가 "터미널에서 /login
         # 한 뒤 새 대화" 라고 적었으므로, 그 조치를 마치고 돌아온 사용자에게
         # 낡은 경고가 그대로 붙어 있으면 안내가 자기 말을 뒤집는다.
@@ -2928,7 +3065,18 @@ class UpwiseChatDock(QDockWidget):
         self.send_message()
 
     def send_message(self, text=None):
-        """입력을 보낸다. 턴 중에는 보내지 않는다(설계 2-4).
+        """입력을 보낸다. 턴 중이면 CLI 큐로 보낸다(0.6.1).
+
+        0.6.0 까지는 턴 중 전송을 거부했다(설계 2-4 "큐에 2개를 쌓지
+        않는다"). 그 제약을 푸는 근거는 **큐를 우리가 들지 않는다**는 실측
+        이다 - 턴 중 stdin 에 쓰면 CLI 가 자기 큐에 쌓고 턴이 끝나면 스스로
+        다음 턴으로 실행한다. 그래서 타이머도 대기 리스트도 재전송 루프도
+        만들지 않는다. UI 가 하는 일은 "지금 보내고, 대기 중임을 적는" 둘뿐
+        이다.
+
+        능력이 없는 백엔드에서는 **현행대로 거부**된다. 거부 판단은 UI 가
+        아니라 `process.send(allow_queue=True)` 가 한다 - 능력 플래그를 UI 에
+        복사하면 두 곳이 갈라진다.
 
         Args:
             text: 보낼 문자열. None 이면 입력 위젯에서 가져온다.
@@ -2968,27 +3116,56 @@ class UpwiseChatDock(QDockWidget):
         backend = self._ensure_backend()
         if backend is None:
             return False
-        if backend.is_busy():
-            return False
-        if not backend.send(body):
+        # 턴이 도는 중인가. 이 값 하나가 "지금 실행" 과 "큐에 쌓임" 을 가른다.
+        queued = bool(backend.is_busy())
+        # 호출 모양을 **새 경로에서만** 바꾼다. 턴이 없을 때는 0.6.0 과
+        # 똑같이 `send(body)` 한 인자로 부른다 - `send` 를 1인자로 구현한
+        # 대역 백엔드(하네스 50·51 의 FakeBackend)가 평시 경로에서 그대로
+        # 돌아야 한다. 섞어서 늘 kwargs 로 부르면 그쪽이 TypeError 로 죽는다
+        # (실측: 하네스 50 D 군이 그렇게 떨어졌다).
+        sent_ok = (backend.send(body, allow_queue=True) if queued
+                   else backend.send(body))
+        if not sent_ok:
             return False
         self._last_user_text = body
         # 0.4.0 입력 히스토리. **보낸 뒤**에 쌓는다 - 가로채기(가드 C)와
         # 전송 실패는 위에서 이미 빠져나갔으므로 여기 닿은 것만 실제 전송분
         # 이다(InputHistory docstring).
         self.input_history.add(body)
-        self.machine.note_sent(body)
+        # 0.6.1 uuid 짝짓기. 제품에서 켜지는 자리가 여기다 - 이 인자가 없으면
+        # 합성 user 줄 필터와 uuid 짝짓기가 꺼진 채로 돈다(하네스 재생에서만
+        # 켜져 있었다). 능력이 없으면 `last_sent_uuid` 가 빈 문자열이고
+        # `note_sent(uuid=None)` 은 0.6.0 과 동작이 같다.
+        msg_uuid = getattr(backend, "last_sent_uuid", "") or None
+        if queued:
+            # **턴을 열지 않는다.** `note_sent` 는 즉시 새 턴을 여는데, 도는
+            # 턴이 있는 상태에서 열면 그 턴이 버려지고(current_turn 교체) 남은
+            # 출력이 새 턴 말풍선으로 섞인다. 큐에 쌓인 메시지는 CLI 가
+            # 실행을 시작할 때 스트림 이벤트로 턴이 열린다(녹화본 재생에서
+            # 턴 2개가 전부 result 로 닫힌 것이 그 증거 - 하네스 105 C6).
+            # 그래서 여기서는 uuid 등록만 한다.
+            self.machine.note_issued_uuid(msg_uuid or "")
+        else:
+            self.machine.note_sent(body, uuid=msg_uuid)
         # 이 턴이 프리셋에서 났는지 기억한다(설계 6-2 마커 판정의 대상 선별).
         # 버튼이 아니라 **보낸 문장**으로 판정한다 - 사용자가 버튼으로 넣은 뒤
         # 손으로 고쳐 보낼 수 있고(자동 전송은 하나뿐이다), 터미널 습관대로
         # 슬래시 명령을 직접 타이핑할 수도 있다.
         preset = detect_mod.preset_for_text(body)
         turn = self.machine.current_turn
-        if preset and turn is not None:
+        # 큐 전송에서는 기록하지 않는다. 그때 `current_turn` 은 **도는 중인
+        # 앞 턴**이고, 거기에 적으면 남의 턴에 프리셋 판정이 걸린다. 이 메시지
+        # 의 턴 번호는 CLI 가 실행을 시작할 때 생기므로 전송 시점에는 없다.
+        if preset and turn is not None and not queued:
             self._preset_turns[turn.turn_no] = preset
         # 사용자 말풍선은 전송 즉시 그린다. replay 이벤트는 렌더하지 않는다
         # (설계 4-2 user 행).
         self.chat_view.add_user_message(body)
+        if queued:
+            # 큐에 쌓였다는 사실을 그 자리에 적는다. 적지 않으면 사용자는
+            # 응답이 오지 않는다고 읽는다.
+            self.chat_view.add_notice(NOTICE_QUEUED)
+            self._on_machine_note("queued_send", "uuid=%s" % (msg_uuid or ""))
         if text is None:
             self.input_edit.clear()
         self._update_controls()
@@ -3016,9 +3193,299 @@ class UpwiseChatDock(QDockWidget):
         self._cancel_elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self._silence_ack_s = 0.0
         self.watchdog_row.setVisible(False)
+        # 트리를 죽이고 다시 띄웠으므로 CLI 큐도 함께 사라졌다. 대기 표시를
+        # 남겨 두면 없는 큐를 가리킨다(0.6.1).
+        self._reset_queue_state()
         self._update_controls()
         self._update_status()
         return ok
+
+    # ------------------------------------------------------------------
+    # 큐와 끼어들기 (0.6.1)
+    # ------------------------------------------------------------------
+
+    def _reset_queue_state(self):
+        """대기·끼어들기 상태를 비운다(0.6.1).
+
+        프로세스가 바뀌거나 세션이 바뀌는 모든 경로에서 부른다 - 취소, 사망,
+        새 대화, 포스처 상승이다. 비우지 않으면 없어진 CLI 큐를 가리키는
+        "대기 N건" 이 남고, 받을 수 없는 영수증을 기다리는 끼어들기가 남는다.
+
+        상태머신의 `lifecycle` 은 여기서 손대지 않는다 - 새 TurnMachine 을
+        세우는 경로(새 대화)는 그쪽이 알아서 비고, 재spawn 경로는 프로세스
+        계층이 자기 집합을 비운다(process._spawn).
+
+        Returns:
+            bool: 끼어들기가 걸려 있던 상태를 지웠는가.
+        """
+        had = bool(self._interrupt_text or self._interrupt_request_id)
+        self._interrupt_text = ""
+        self._interrupt_request_id = ""
+        self._interrupt_acked = False
+        self.queue_row.setVisible(False)
+        self.queue_label.setText("")
+        return had
+
+    def _queued_count(self):
+        """지금 차례를 기다리는 메시지 수.
+
+        **원천은 상태머신의 lifecycle 집합 하나다.** `result.queued_turn_count`
+        를 쓰지 않는다 - 네 result 전부 0 이었고 다음 메시지가 대기 중인
+        시점의 result 도 0 이었다(실측). 그 필드로 그리면 영구 0 이다.
+
+        런타임 하향(0.6.1 V47-A07)
+            백엔드가 "큐 수명 축을 지금 믿을 수 없다" 고 말하면 0 이다 -
+            init 광고에 그 능력이 없는 CLI 판본에서는 lifecycle 이 오지
+            않거나 불완전하고, 그 집합으로 숫자를 그리면 근거 없는 수를
+            보여 준다. 그 창구가 없는 백엔드(구 대역·하네스 가짜)는
+            **0.6.0 처럼** 그대로 센다.
+
+        Returns:
+            int
+        """
+        backend = self.backend
+        live = getattr(backend, "lifecycle_live", None)
+        if callable(live) and not live():
+            return 0
+        try:
+            return int(self.machine.outstanding_count())
+        except AttributeError:
+            # 0.6.0 상태머신(창구 없음). 큐 표시만 꺼진다.
+            return 0
+
+    def _queued_uuids(self):
+        """대기 중인 메시지 uuid 들. 취소 요청이 이 목록을 돈다.
+
+        Returns:
+            tuple
+        """
+        try:
+            return tuple(self.machine.queued_uuids())
+        except AttributeError:
+            return ()
+
+    def _apply_busy_label(self):
+        """진행 중 표시의 보임·글자·툴팁을 **한 자리에서** 조립한다(0.6.1).
+
+        왜 한 자리인가
+            0.6.0 까지 이 라벨의 글자를 `_update_controls` 와 워치독 틱 두
+            곳이 각각 썼다. 거기에 대기 건수를 더하면 한쪽이 다른쪽의 꼬리를
+            지운다(틱이 점만 돌리며 꼬리를 날리거나, 갱신이 점을 0 으로
+            되돌린다). 그래서 조립을 이 함수로 모으고 두 곳은 이것만 부른다.
+
+        Returns:
+            tuple: (busy 인가, 대기 건수)
+        """
+        backend = self.backend
+        busy = bool(backend is not None and backend.is_busy())
+        waiting = self._queued_count()
+        self.busy_label.setVisible(busy)
+        if not busy:
+            self._busy_dots = 0
+            self.busy_label.setText("")
+            return (False, waiting)
+        text = BUSY_TEXT % ("." * self._busy_dots)
+        if waiting:
+            text += BUSY_QUEUE_SUFFIX % waiting
+        self.busy_label.setText(text)
+        return (True, waiting)
+
+    def _refresh_queue_bar(self):
+        """대기 안내 바를 지금 대기 건수에 맞춘다(0.6.1).
+
+        대기가 0 이면 내린다. 상시 위젯이 아니므로 숨은 동안 레이아웃이
+        이 줄을 세지 않고(Qt 는 숨은 항목을 건너뛴다) 독 최소 폭에도 안
+        들어온다.
+
+        Returns:
+            int: 지금 대기 건수.
+        """
+        waiting = self._queued_count()
+        if waiting:
+            self.queue_label.setText(QUEUE_BAR_TEXT % waiting)
+        else:
+            self.queue_label.setText("")
+        self.queue_row.setVisible(bool(waiting))
+        self.queue_cancel_button.setEnabled(bool(waiting))
+        return waiting
+
+    def _on_queue_cancel_clicked(self):
+        """[대기 취소] 버튼. clicked 의 bool 인자를 삼킨다."""
+        return self.cancel_queued()
+
+    def cancel_queued(self):
+        """대기 중인 메시지 전부에 취소 요청을 보낸다(0.6.1).
+
+        uuid 마다 한 발이다. 취소는 **메시지 단위** 요청이고(영수증이
+        `cancelled` 를 메시지별로 돌려준다) 한 발로 묶는 형태는 측정되지
+        않았다 - 측정 안 된 형태를 지어내지 않는다.
+
+        도는 중인 턴은 건드리지 않는다. 그쪽을 멈추는 것은 끼어들기다.
+
+        Returns:
+            int: 보낸 요청 수.
+        """
+        backend = self.backend
+        if backend is None:
+            return 0
+        uuids = self._queued_uuids()
+        if not uuids:
+            return 0
+        # subtype 이름은 백엔드가 쥔다(docs/7 2-10 경계 6). UI 는 리터럴을
+        # 들지 않고 등록용으로 읽기만 한다.
+        subtype = getattr(backend, "cancel_queued_subtype", "")
+        if not subtype:
+            # 어댑터가 이 요청 이름을 모른다. 조용히 아무것도 하지 않는다.
+            self._on_machine_note("queue_cancel_unsupported", "")
+            return 0
+        sent = 0
+        for msg_uuid in uuids:
+            request_id = backend.cancel_queued_message(msg_uuid)
+            if not request_id:
+                continue
+            # 우리 요청으로 등록한다. 등록하지 않으면 영수증이 짝 없는
+            # 응답으로 떨어진다(중단 판정의 근거가 이 등록이다).
+            self.machine.note_control_sent(request_id, subtype)
+            self._queue_cancel_requests += 1
+            sent += 1
+        if sent:
+            self.chat_view.add_notice(NOTICE_QUEUE_CANCELLED % sent)
+            self._on_machine_note("queue_cancel_sent", "n=%d" % sent)
+        self._update_controls()
+        self._update_status()
+        return sent
+
+    def _on_interrupt_shortcut(self):
+        """Ctrl+Shift+Enter. 단축키의 인자 없는 신호를 받아 넘긴다."""
+        return self.interrupt_and_send()
+
+    def interrupt_and_send(self, text=None):
+        """지금 턴을 중단하고, 영수증을 받은 뒤 입력을 보낸다(0.6.1).
+
+        [취소] 버튼과 **다른 경로다.** 그쪽은 트리 종료 + `--resume` 재spawn
+        이고 이쪽은 같은 프로세스를 유지한다(실측: 중단된 턴의 result 뒤에 새
+        spawn 없이 다음 메시지가 정상 처리됐다). 버튼의 뜻은 바꾸지 않는다.
+
+        영수증을 기다리는 이유
+            중단된 턴의 result 가 `is_error=true` 로 오는데, 그것이 "우리가
+            중단시킨 것" 인지 "진짜 오류" 인지는 **우리 요청의 영수증을
+            받았다는 사실**로만 갈린다. 시간으로 재지 않는다. 그래서 전송도
+            영수증 뒤로 미룬다 - 먼저 보내면 중단 전에 큐로 들어간다.
+
+        Args:
+            text: 보낼 문자열. None 이면 입력 위젯에서 가져온다.
+
+        Returns:
+            bool: 중단 요청을 보냈는가.
+        """
+        backend = self.backend
+        if backend is None:
+            return False
+        body = self.input_edit.toPlainText() if text is None else text
+        body = (body or "").strip()
+        if not backend.is_busy():
+            # 도는 턴이 없다. 중단할 것이 없으므로 평소 전송과 같다.
+            return bool(body) and self.send_message(text)
+        request_id = backend.interrupt_turn()
+        if not request_id:
+            # 능력이 없거나 라이터가 닫혔다. 기존 경로를 안내만 한다.
+            self.chat_view.add_notice(NOTICE_INTERRUPT_UNSUPPORTED)
+            self._on_machine_note("interrupt_unsupported", "")
+            return False
+        self.machine.note_control_sent(
+            request_id, getattr(backend, "interrupt_subtype", ""))
+        self._interrupt_request_id = request_id
+        self._interrupt_text = body
+        self._interrupt_acked = False
+        self._interrupt_requests += 1
+        self.chat_view.add_notice(NOTICE_INTERRUPT_SENT)
+        self._on_machine_note("interrupt_sent", "request_id=%s" % request_id)
+        self._update_controls()
+        self._update_status()
+        return True
+
+    def _on_control_response(self, request_id, subtype, payload, matched):
+        """제어 응답 1건(0.6.1). 우리 끼어들기의 영수증이면 깃발만 세운다.
+
+        **여기서 보내지 않는다.** 이 콜백은 드레인 중(`process._inspect`)에
+        불리고 그 시점에 상태머신은 아직 그 배치를 먹지 않았다. 그 자리에서
+        보내면 턴 경계가 뒤집힌다. 실제 전송은 `_on_events` 끝에서 한다.
+
+        Args:
+            request_id: 응답이 반향한 요청 식별자.
+            subtype: 응답 subtype(실관측은 success 하나다).
+            payload: 영수증 본문 dict.
+            matched: 프로세스 계층이 짝지은 요청 subtype. 빈 문자열이면 짝이
+                없는 응답이다.
+
+        Returns:
+            bool: 우리 끼어들기의 영수증이었는가.
+        """
+        self._on_machine_note(
+            "control_response",
+            "request_id=%s subtype=%s matched=%s keys=%s"
+            % (request_id, subtype, matched,
+               ",".join(sorted(payload or {}))))
+        if not request_id or request_id != self._interrupt_request_id:
+            return False
+        self._interrupt_acked = True
+        return True
+
+    def _flush_interrupt_send(self):
+        """영수증을 받은 끼어들기의 보류 전송을 처리한다(0.6.1).
+
+        `_on_events` 끝에서만 불린다 - 그 시점에 상태머신이 이번 배치를 다
+        먹었으므로 중단된 턴이 이미 닫혀 있다.
+
+        보낼 글이 없으면(단축키만 누름) 중단만 하고 끝낸다. 지어낸 요청을
+        보내지 않는다(상승 재전송의 같은 규약).
+
+        Returns:
+            bool: 보냈는가.
+        """
+        if not self._interrupt_acked:
+            return False
+        text = self._interrupt_text
+        self._interrupt_acked = False
+        self._interrupt_request_id = ""
+        self._interrupt_text = ""
+        if not text:
+            return False
+        sent = self.send_message(text)
+        if sent:
+            # 입력창은 보낸 뒤에 비운다. send_message(text=...) 는 인자를
+            # 받았으므로 스스로 비우지 않는다.
+            self.input_edit.clear()
+            self._update_controls()
+        return bool(sent)
+
+    def _check_interrupted_turn(self):
+        """중단된 턴을 **오류가 아니라 공지**로 적는다(0.6.1).
+
+        중단된 턴의 result 는 `error_during_execution`·`is_error=true`·
+        `result=null`·cost 0 으로 오고, 그 뒤 같은 프로세스가 다음 메시지를
+        정상 처리한다(실측). 그래서 백엔드 사망·오류 문면을 쓰지 않는다.
+        분류는 상태머신이 이미 했다(`Turn.interrupted`) - 여기서는 그 판정을
+        읽어 공지 한 줄을 붙인다.
+
+        턴당 한 번이다. 같은 턴을 다시 보고 또 적지 않는다(미로그인 공지와
+        같은 근거).
+
+        Returns:
+            bool: 이번 호출에서 공지를 새로 붙였는가.
+        """
+        added = False
+        for turn in self.machine.turns:
+            if not getattr(turn, "interrupted", False):
+                continue
+            if turn.turn_no in self._interrupted_notice_turns:
+                continue
+            self._interrupted_notice_turns.add(turn.turn_no)
+            self.chat_view.add_notice(NOTICE_INTERRUPTED)
+            self._on_machine_note("turn_interrupted_notice",
+                                  "turn=%d" % turn.turn_no)
+            added = True
+        return added
 
     def set_cwd(self, path):
         """cwd 표시를 갱신하고 프리셋 활성 상태를 다시 계산한다(설계 7-1 [6], 6-3).
@@ -3555,6 +4022,8 @@ class UpwiseChatDock(QDockWidget):
         self._posture_name = spec.name
         self._elevate_count += 1
         self.machine.note_starting()
+        # 재spawn 이므로 CLI 큐가 사라졌다(0.6.1, cancel 과 같은 근거).
+        self._reset_queue_state()
         self.chat_view.add_notice(
             NOTICE_POSTURE_SWITCHED
             % posture_mod.POSTURE_LABELS.get(spec.name, spec.name))
@@ -3746,6 +4215,10 @@ class UpwiseChatDock(QDockWidget):
         self._posture_name = spec.name
         self._elevate_count += 1
         self.machine.note_starting()
+        # 재spawn 이므로 CLI 큐가 사라졌다(0.6.1). 재전송은 아래에서 **새**
+        # 전송으로 들어간다 - 대기 집합을 들고 가면 그 전송이 큐 전송으로
+        # 오인된다.
+        self._reset_queue_state()
         self.chat_view.add_notice(NOTICE_ELEVATED)
         if not text:
             # 보낼 원문이 없으면 상승만 하고 끝낸다. 지어낸 요청을 보내지 않는다.
@@ -3787,10 +4260,17 @@ class UpwiseChatDock(QDockWidget):
         # 미로그인 공지도 전사 동기화 뒤다(마커 공지와 같은 근거) - CLI 원문
         # 행이 먼저 그려지고 그 뒤에 안내가 와야 읽는 순서가 맞다.
         self._check_login_failure()
+        # 중단된 턴 공지(0.6.1). 전사 동기화 뒤다 - 공지 한 줄이 그 턴 글 뒤에
+        # 와야 읽는 순서가 맞다(마커·미로그인 공지와 같은 근거).
+        self._check_interrupted_turn()
         self._update_denial_bar()
         self._update_chip()
         self._update_controls()
         self._update_status()
+        # 끼어들기 보류 전송은 **이 배치를 다 먹은 뒤**다. 콜백 자리에서
+        # 보내면 상태머신이 아직 이 배치를 먹지 않은 상태에서 턴이 열린다
+        # (_on_control_response docstring).
+        self._flush_interrupt_send()
 
     def _on_stderr(self, raw):
         """stderr 한 줄. 진단에만 쌓고 전사에 섞지 않는다(설계 4-2)."""
@@ -3805,6 +4285,10 @@ class UpwiseChatDock(QDockWidget):
         if tail:
             text += "\nstderr 꼬리:\n" + tail
         self.chat_view.add_notice(text)
+        # 자식이 죽었으면 CLI 큐도 함께 사라졌다. 대기 표시와 기다리던
+        # 영수증을 지운다(0.6.1) - 안 지우면 없는 큐를 가리키고, 받을 수 없는
+        # 영수증 때문에 보류 전송이 영구히 남는다.
+        self._reset_queue_state()
         # 전제조건 바의 "기동 실패" 항목(설계 7-1 [2]). 다시 뜨면 지운다.
         self._backend_rc = rc
         self.refresh_prerequisites()
@@ -3982,9 +4466,12 @@ class UpwiseChatDock(QDockWidget):
             self.refresh_prerequisites()
 
         # 진행 중 표시의 점을 한 칸 돌린다. 전용 타이머를 만들지 않는다.
+        #
+        # 0.6.1: 글자를 직접 쓰지 않고 조립 함수를 부른다. 직접 쓰면 대기
+        # 건수 꼬리를 매 틱 지운다(_apply_busy_label docstring).
         if self.busy_label.isVisible():
             self._busy_dots = (self._busy_dots + 1) % (BUSY_DOTS_MAX + 1)
-            self.busy_label.setText(BUSY_TEXT % ("." * self._busy_dots))
+            self._apply_busy_label()
 
         turn = self.machine.current_turn
         if turn is None:
@@ -4056,7 +4543,11 @@ class UpwiseChatDock(QDockWidget):
     def _update_controls(self):
         """전송/취소 버튼과 입력 placeholder 를 상태에 맞춘다.
 
-        턴 중에는 전송을 막는다. 큐에 2개를 쌓지 않는다(설계 2-4).
+        0.6.1: **턴 중에도 전송을 막지 않는다.** 보낸 글은 CLI 큐에 쌓이고
+        턴이 끝나면 자동으로 다음 턴으로 실행된다(설계 2-4 의 정정 근거는
+        `send_message` docstring). 능력이 없는 백엔드에서는 `process.send`
+        가 거부하므로 버튼이 켜져 있어도 보내지지 않는다 - 거부 판단을 UI 에
+        복사하지 않는 쪽이다.
         """
         has_factory = self._backend_factory is not None
         backend = self.backend
@@ -4075,7 +4566,9 @@ class UpwiseChatDock(QDockWidget):
             placeholder = PLACEHOLDER_NO_BACKEND
         self.input_edit.setPlaceholderText(placeholder)
         has_text = bool(self.input_edit.toPlainText().strip())
-        self.send_button.setEnabled(can_type and has_text and not busy)
+        # `not busy` 를 뺐다(0.6.1 요구사항 1). 입력창은 전부터 busy 와
+        # 무관했고 버튼만 꺼져 있었다.
+        self.send_button.setEnabled(can_type and has_text)
         self.cancel_button.setEnabled(alive or busy)
         self.cwd_label.setEnabled(not busy)
         # 내보내기(0.2.3). 빈 전사를 저장하면 머리글만 있는 파일이 생기므로
@@ -4088,14 +4581,10 @@ class UpwiseChatDock(QDockWidget):
         self._refresh_clear_button()
         # 새 대화(U16). 턴 축만 본다 - 빈 화면에서도 세션은 새로 시작할 수 있다.
         self._refresh_new_button()
-        # 진행 중 표시(0.2.2). 전송 버튼이 꺼진 이유가 "턴이 돌고 있어서" 임을
-        # 그 자리에서 보여 준다. 점 개수는 워치독 틱이 돌린다.
-        self.busy_label.setVisible(bool(busy))
-        if not busy:
-            self._busy_dots = 0
-            self.busy_label.setText("")
-        elif not self.busy_label.text():
-            self.busy_label.setText(BUSY_TEXT % "")
+        # 진행 중 표시(0.2.2) + 대기 건수(0.6.1). 글자 조립은 한 자리에만
+        # 둔다 - 워치독 틱도 같은 함수를 부른다(_apply_busy_label docstring).
+        self._apply_busy_label()
+        self._refresh_queue_bar()
 
     def _update_status(self):
         """[7] 상태 바 한 줄."""
@@ -4216,6 +4705,20 @@ class UpwiseChatDock(QDockWidget):
                 theme_mod.STATE_PROPERTY) or ""),
             "busy_visible": not self.busy_label.isHidden(),
             "busy_text": self.busy_label.text(),
+            # 0.6.1 큐·끼어들기. 대기 건수의 **출처**는 상태머신이고
+            # `result.queued_turn_count` 가 아니다(_queued_count docstring).
+            "busy_tooltip": self.busy_label.toolTip(),
+            "queued_count": self._queued_count(),
+            "queued_uuids": list(self._queued_uuids()),
+            "queue_bar_visible": not self.queue_row.isHidden(),
+            "queue_bar_text": self.queue_label.text(),
+            "queue_cancel_enabled": self.queue_cancel_button.isEnabled(),
+            "interrupt_requests": int(self._interrupt_requests),
+            "interrupt_pending_text": self._interrupt_text,
+            "interrupt_request_id": self._interrupt_request_id,
+            "interrupt_acked": bool(self._interrupt_acked),
+            "queue_cancel_requests": int(self._queue_cancel_requests),
+            "interrupted_turns": sorted(self._interrupted_notice_turns),
             "cwd_display": self.cwd_label.text(),
             "preset_states": self.preset_row.states(),
             "preset_turns": dict(self._preset_turns),

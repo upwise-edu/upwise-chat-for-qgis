@@ -44,11 +44,12 @@ import queue
 import subprocess
 import sys
 import time
+import uuid as uuid_mod
 from pathlib import Path
 
 from qgis.PyQt.QtCore import QObject, QThread, QTimer, pyqtSignal
 
-from . import adapter_registry
+from . import adapter_registry, protocol
 from .logbook import SessionLogbook, qgis_profile_root
 
 # QGIS 플러그인에서 콘솔 창 깜빡임 방지(설계 2-3 실측 플래그).
@@ -97,6 +98,35 @@ GATE_RESTART_MAX = 1
 # 드레인 틱 안에서 동기 재시작을 하면 그 틱이 쓰던 큐가 교체된다. 또 게이트를
 # 깨뜨린 그 배치가 UI 로 올라가기 전에 끊기면 사용자가 이유를 못 본다.
 GATE_RESTART_DELAY_S = 0.5
+
+# ----- 고아 미결 uuid 백스톱 상한 (0.6.1, V47-A03) -----
+#
+# 왜 상한이 필요한가
+#     미결 집합은 lifecycle 의 `completed`/`cancelled` 로만 빈다. 번들
+#     스키마에 `detachedToolCall: true` 경로가 있어 **큐에 쌓인 메시지가
+#     한 턴에 접힐(coalesce) 수 있고** `[스키마]`, 접힌 uuid 에 종결
+#     이벤트가 오지 않으면 그 uuid 는 영구히 남는다. 그러면 `is_busy()` 가
+#     영구 True 가 되고 UI 가 입력을 영구히 게이트한다 - 사용자 원 불만
+#     ("분석 진행 중에 채팅을 넣을 수 없다") 과 같은 증상이다.
+#     주 처방은 `result.user_message_uuids` 기준 정산이고(`_settle_by_result`)
+#     이 두 상한은 그것도 비껴간 경우만 받는 백스톱이다.
+#
+# 왜 턴 수를 시계로 쓰는가 (2)
+#     `result` 는 "CLI 가 턴 하나를 끝냈다" 는 증거다. 그래서 이 시계는
+#     **CLI 가 도는 동안에는 전진하지 않는다** - 반대 방향 위험(CLI 가
+#     실행 중인데 한가하다고 믿는 것)을 구조적으로 못 만든다. 1 로 두면
+#     정상 인계(앞 턴 result 시점에 다음 메시지가 `queued`)를 오판하므로
+#     2 다. 즉 자기 앞 턴과 자기 턴이 둘 다 닫혔는데도 전이가 없었던
+#     uuid 만 걸린다.
+ORPHAN_PENDING_TURNS_MAX = 2
+
+# 왜 침묵을 두 번째 시계로 쓰는가 (180초)
+#     result 가 더 오지 않으면 위 턴 시계는 멈춘다. 그 경우의 유계 시간이
+#     필요하고, 기준은 경과가 아니라 **침묵**이다(설계 4-5 워치독과 같은
+#     판별). 상태머신의 침묵 경고 임계가 120초이므로(machine.SILENCE_WARN_S)
+#     그 1.5배로 둔다 - 사용자가 침묵 경고를 먼저 보고, 그 뒤에 백스톱이
+#     돈다. 이 시계는 `started` 가 하나도 없을 때만 쓴다(아래 sweep 참조).
+ORPHAN_PENDING_SILENCE_S = 180.0
 
 # 자식에게 물려주지 않는 상속 PYTHON 환경변수(0.1.2 사전 명세).
 #
@@ -202,7 +232,7 @@ def child_env(base=None, backend=None):
     return env, stripped, bool(adp.api_key_env) and adp.api_key_env in env
 
 
-def stream_json_user(text, backend=None):
+def stream_json_user(text, backend=None, uuid=None):
     """stdin 에 쓸 사용자 메시지 한 줄(설계 2-4, PoC 와 동일 포맷).
 
     직렬화 포맷은 백엔드 고유 지식이라 어댑터로 위임한다
@@ -212,8 +242,30 @@ def stream_json_user(text, backend=None):
     Args:
         text: 사용자 입력 원문.
         backend: 백엔드 어댑터. None 이면 기본 백엔드다.
+        uuid: 이 메시지에 붙일 클라이언트 식별자(0.6.1). None 이면 0.6.0
+            과 바이트 동일한 줄이 나온다 - 하네스 07 이 그 바이트를 잰다.
     """
-    return (backend or adapter_registry.default()).serialize_user_input(text)
+    adp = backend or adapter_registry.default()
+    if uuid is None:
+        # 인자를 아예 넘기지 않는다. 구 어댑터(1인자 서명)와도 호환된다.
+        return adp.serialize_user_input(text)
+    return adp.serialize_user_input(text, uuid=uuid)
+
+
+def stream_json_control(request_id, subtype, backend=None, **fields):
+    """stdin 에 쓸 제어 요청 한 줄(0.6.1).
+
+    `stream_json_user` 와 같은 이유로 모듈 수준 함수로 둔다 - 하네스가
+    프로세스를 띄우지 않고 바이트만 재는 창구가 필요하다.
+
+    Args:
+        request_id: 이 요청의 식별자. 응답이 반향한다.
+        subtype: 요청 종류. 이름은 어댑터가 쥔다.
+        backend: 백엔드 어댑터. None 이면 기본 백엔드다.
+        **fields: 요청별 인자. None 인 것은 어댑터가 버린다.
+    """
+    adp = backend or adapter_registry.default()
+    return adp.serialize_control_request(request_id, subtype, **fields)
 
 
 def tree_kill(pid):
@@ -551,6 +603,73 @@ class BackendProcess(QObject):
         # 시그널을 만들지 않는다). 수신 측은 그 슬롯에서 이 값을 읽는다.
         self.last_init_event = None
 
+        # ----- 0.6.1 큐·제어 배선 -----
+        #
+        # 이 블록은 전부 "CLI 가 지금 무엇을 들고 있는가" 를 추적한다.
+        # UI 는 없고(다음 단계), 여기서는 창구만 만든다.
+
+        # 세션 개시 이벤트가 광고한 런타임 능력 이름 집합. 게이트가 돌기
+        # 전에는 빈 집합이다 - **빈 집합은 "모른다" 가 아니라 "광고된 것이
+        # 없다"** 로 쓰므로, 구 CLI 판본에서 이 필드가 없으면 그냥 비어
+        # 있고 `has_cli_capability` 가 전부 False 를 돌려준다. 열린 집합이라
+        # 모르는 이름은 무시한다.
+        self.cli_capabilities = frozenset()
+
+        # 세션 개시 이벤트를 **한 번이라도 봤는가**(0.6.1, V47-A07).
+        #
+        # `cli_capabilities` 의 빈 집합만으로는 "아직 init 전" 과 "init 이
+        # 아무것도 광고하지 않았다(구 CLI)" 를 가를 수 없다. 두 상태의 처분이
+        # 반대이므로(전자는 선언 플래그로 시도, 후자는 하향 조정) 깃발을
+        # 따로 든다. **init 은 첫 전송 뒤에만 온다**(이 저장소 D06 실측)는
+        # 것이 이 설계의 제약이다 - 첫 메시지는 런타임으로 게이트할 수 없다.
+        self._caps_seen = False
+
+        # 미결 메시지. command_uuid -> 마지막 state.
+        # `queued`/`started` 만 남고 `completed`/`cancelled` 에서 지운다.
+        # **대기 건수의 유일한 원천이다.** `result.queued_turn_count` 는
+        # 쓰지 않는다 - 네 result 전부 0 이었고 B 가 대기 중인 시점의
+        # result 도 0 이었다(실관측). 그 필드로 그리면 영구 0 이다.
+        self._pending_queue = {}
+
+        # 미결 uuid 별 진행 표식(0.6.1 백스톱, V47-A03).
+        # command_uuid -> (집합에 들어온/상태가 움직인 시점의 턴 종료 누적수,
+        # 그 시점의 monotonic 초). 백스톱이 "이 uuid 는 그 뒤로 아무 전이도
+        # 없었다" 를 재는 기준이고, 상태가 움직이면 갱신한다(진전이 있었다).
+        self._pending_marks = {}
+
+        # 턴 종료 이벤트 누적수. 백스톱의 시계다 - CLI 가 도는 동안에는
+        # 전진하지 않으므로 "실행 중인데 한가하다고 믿는" 방향을 못 만든다.
+        self._turn_end_count = 0
+
+        # 마지막으로 stdout 줄을 본 시점(monotonic). 침묵 시계의 기준이다.
+        # None 이면 아직 한 줄도 못 본 것이고, 그때 침묵 백스톱은 돌지 않는다.
+        self._last_line_mono = None
+
+        # 백스톱이 비운 uuid 누적수. 진단과 하네스가 읽는다. 조용히 지우지
+        # 않는다는 규칙의 관측 창구다.
+        self.orphan_pending_cleared = 0
+
+        # 우리가 보낸 제어 요청. request_id -> subtype. 응답이 오면 지운다.
+        self._pending_control = {}
+
+        # 짝이 없는 control_response. **버리지 않는다** - CLI 가 originate
+        # 하는 요청(권한 질의 등)의 응답이 섞여 올 수 있고, 이 단계에서는
+        # 답하지 않되 관측은 남긴다.
+        self.unmatched_control_responses = []
+
+        # 마지막으로 발급한 메시지 uuid. `send()` 의 반환 계약(bool)을
+        # 바꾸지 않으려고 둔 창구다.
+        self.last_sent_uuid = ""
+
+        # 이 spawn 에서 우리가 발급한 메시지 uuid 전부(발급 순서).
+        # 재방출 user 줄이 우리 것인지 가르는 집합이다.
+        self.sent_uuids = []
+
+        # control_response 를 받은 호출자 콜백. callable(request_id, subtype,
+        # payload, matched_subtype). UI 단계가 붙인다. 시그널을 새로 만들지
+        # 않는 이유는 설계 2-6 과 같다(이벤트당 시그널 금지).
+        self.on_control_response = None
+
         # 재시작 장부. (시각, 사유) 를 윈도우 안에서만 센다.
         self._restart_marks = collections.deque()
         self.session_id = None
@@ -565,8 +684,166 @@ class BackendProcess(QObject):
         return self._proc is not None and self._proc.poll() is None
 
     def is_busy(self):
-        """턴이 진행 중인가. 설계 2-4 의 입력 차단 판정에 쓴다."""
-        return self._busy
+        """CLI 가 지금 일하고 있는가. 설계 2-4 의 입력 차단 판정에 쓴다.
+
+        0.6.1 보정 - 왜 `_busy` 단독으로는 틀리는가
+            `_busy` 는 턴 종료 이벤트를 보는 즉시 False 가 된다. 그런데
+            CLI 큐에 다음 메시지가 있으면 그 자리에서 **곧바로 다음 턴을
+            시작**한다(실관측: completed A -> started B -> 새 세션 개시
+            이벤트). 그 구간에서 `_busy` 는 False 인데 CLI 는 실행 중이다.
+            그래서 미결 집합이 비어 있지 않으면 바쁜 것으로 본다.
+
+        폴백 - 두 축을 다 본다(0.6.1, V47-A07)
+            `lifecycle_live()` 가 False 면 이 함수는 **0.6.0 과 똑같이**
+            `_busy` 단독이 된다. 그 함수가 보는 것은 두 축이다 - 어댑터
+            선언 플래그(`capabilities.queue_lifecycle`)와 init 이 광고한
+            런타임 능력(`msg_lifecycle_v1`). 능력 판정을 미결 집합보다
+            먼저 보는 이유는, 능력이 없는 백엔드에서 어떤 경로로든 집합에
+            값이 들어가더라도 판정이 바뀌지 않게 못박기 위함이다.
+
+        관측하지 않은 state 로 입력을 막지 않는다
+            세는 것은 **실측된 미결 state 두 개**(`queued`·`started`)뿐이다.
+            번들 스키마에는 `discarded`·`refused` 도 있지만 관측되지
+            않았고, 그 값을 "아직 실행 중" 으로 읽으면 그 state 가 종료
+            신호였을 때 입력이 영구히 막힌다. 모르는 state 는 집합에 남겨
+            기록하되(`lifecycle_unknown_state`) 바쁨 판정에는 쓰지 않는다 -
+            모르는 것으로 단정하지 않는 쪽이다.
+
+        Returns:
+            bool
+        """
+        if self._busy:
+            return True
+        if not self.lifecycle_live():
+            return False
+        return bool(self.open_queue_uuids())
+
+    def _runtime_cap_live(self, cap_name):
+        """런타임 능력 1종이 지금 쓸 수 있는가(0.6.1, V47-A07).
+
+        하향 조정만 한다 - **상향은 없다.** 세 상태를 가른다.
+
+            어댑터가 이름을 모른다(`cap_name` 이 빈 문자열)
+                판정할 축이 없다. True 를 돌려 선언 플래그 단독 판정으로
+                되돌린다. 제2 백엔드가 이 이름을 모른다고 기능이 꺼지면
+                안 된다.
+            아직 init 을 못 봤다(`_caps_seen` False)
+                True 다. **init 은 첫 전송 뒤에만 온다**(D06 실측)이므로
+                첫 메시지를 런타임으로 게이트하면 아무도 아무것도 못
+                보낸다. 그래서 "선언 플래그로 시도하고, init 을 본 뒤
+                광고에 없으면 의존을 내린다" 가 유일하게 가능한 모양이다.
+            init 을 봤다
+                광고 집합의 포함 여부 그대로다. 열린 집합이므로 모르는
+                이름은 무시하고, 쓰는 능력만 이름으로 확인한다(번들 지시:
+                "check each capability for exactly the behavior you use").
+
+        Args:
+            cap_name: 런타임 능력 이름. 빈 문자열이면 판정하지 않는다.
+
+        Returns:
+            bool
+        """
+        if not cap_name:
+            return True
+        if not self._caps_seen:
+            return True
+        return cap_name in self.cli_capabilities
+
+    def lifecycle_live(self):
+        """큐 수명 축(대기 건수·미결 집합)을 지금 믿어도 되는가(0.6.1).
+
+        선언 플래그와 런타임 광고를 **둘 다** 본다. 선언은 "이 어댑터가
+        말할 줄 안다" 이고 런타임은 "지금 붙은 CLI 판본이 실제로 가졌다"
+        로 다른 축이다 - 섞으면 구 CLI 에서 조용히 깨진다.
+
+        Returns:
+            bool
+        """
+        if not self._backend.capabilities.queue_lifecycle:
+            return False
+        return self._runtime_cap_live(
+            getattr(self._backend, "runtime_cap_queue_lifecycle", ""))
+
+    def interrupt_live(self):
+        """턴 중단 요청을 지금 보내도 되는가(0.6.1).
+
+        Returns:
+            bool
+        """
+        if not self._backend.capabilities.control_interrupt:
+            return False
+        return self._runtime_cap_live(
+            getattr(self._backend, "runtime_cap_interrupt", ""))
+
+    def cancel_queued_live(self):
+        """대기 메시지 취소 요청을 지금 보내도 되는가(0.6.1).
+
+        Returns:
+            bool
+        """
+        if not self._backend.capabilities.control_interrupt:
+            return False
+        return self._runtime_cap_live(
+            getattr(self._backend, "runtime_cap_cancel_queued", ""))
+
+    def has_cli_capability(self, name):
+        """세션 개시 이벤트가 이 런타임 능력을 광고했는가(0.6.1).
+
+        선언 플래그(`capabilities.*`)와 **다른 축**이다. 선언은 "이 어댑터가
+        이 기능을 말할 줄 안다" 이고 이쪽은 "지금 붙어 있는 CLI 판본이
+        실제로 광고한다" 다. 구 판본은 이 목록 자체가 없을 수 있으므로
+        그때는 전부 False 다.
+
+        Args:
+            name: 능력 이름.
+
+        Returns:
+            bool
+        """
+        return name in self.cli_capabilities
+
+    def pending_queue_uuids(self):
+        """종료 신호를 받지 못한 메시지 uuid 전부.
+
+        실측된 미결 state 두 개 외에 모르는 state 로 남은 것까지 포함한다 -
+        관측 기록용이다. 바쁨 판정은 `open_queue_uuids()` 를 쓴다.
+
+        Returns:
+            tuple: 수신 순서. 빈 튜플이면 미결 없음.
+        """
+        return tuple(self._pending_queue)
+
+    def open_queue_uuids(self):
+        """실측된 미결 state(`queued`·`started`)에 있는 메시지 uuid 들.
+
+        `is_busy()` 의 원천이다. `pending_queue_uuids()` 의 부분집합이고,
+        차집합은 관측 밖의 state 로 남은 것들이다.
+
+        Returns:
+            tuple
+        """
+        return tuple(k for k, v in self._pending_queue.items()
+                     if v in protocol.LIFECYCLE_OPEN_STATES)
+
+    def queued_queue_uuids(self):
+        """아직 시작되지 않은(대기 중인) 메시지 uuid 들.
+
+        UI 의 "대기 N건" 이 읽을 값이다. `pending_queue_uuids()` 에서
+        실행 중인 것을 뺀 부분집합이다.
+
+        Returns:
+            tuple
+        """
+        return tuple(k for k, v in self._pending_queue.items()
+                     if v == protocol.LIFECYCLE_QUEUED)
+
+    def pending_control_ids(self):
+        """응답을 기다리는 제어 요청 id 들.
+
+        Returns:
+            tuple
+        """
+        return tuple(self._pending_control)
 
     def _make_spec(self, resume_session_id):
         """공장을 불러 SpawnSpec 을 받는다. 인자 수는 생성 시 캐시했다."""
@@ -588,6 +865,19 @@ class BackendProcess(QObject):
         self._out_eof = False
         self._dead_since = None
         self._busy = False
+        # 새 자식은 큐도 제어 요청도 물려받지 않는다. 비우지 않으면
+        # is_busy() 가 죽은 자식의 미결 집합 때문에 영구히 True 가 된다.
+        self._pending_queue = {}
+        self._pending_control = {}
+        self._pending_marks = {}
+        self._turn_end_count = 0
+        self._last_line_mono = None
+        # 새 자식의 init 을 아직 못 봤다. 하향 조정을 물려받지 않는다 -
+        # 판본이 바뀐 CLI 로 재spawn 될 수 있다(사용자가 그 사이에 업데이트).
+        self.cli_capabilities = frozenset()
+        self._caps_seen = False
+        self.sent_uuids = []
+        self.last_sent_uuid = ""
         # 새 세션이면 드리프트 기준(게이트 5)도 새로 잡는다. 이전 세션의 요약과
         # 비교하면 session_id 가 달라 매번 깨진다. 재개(--resume)는 같은
         # session_id 가 돌아오므로(D01) 기준을 유지한다. 단 포스처를 올린
@@ -720,18 +1010,55 @@ class BackendProcess(QObject):
         """예약된 줄. 검증 하네스가 읽는다."""
         return self._pending_prefix or ""
 
-    def send(self, text):
+    def send(self, text, allow_queue=False):
         """사용자 메시지를 라이터 큐에 넣는다.
 
-        큐에 2개를 쌓지 않는다(설계 2-4). 턴이 진행 중이면 거부한다. 동시 요청이
-        QGIS MCP 단일 소켓 제약과 겹치면 원인 추적이 불가능해진다.
+        0.6.1 이 바꾼 것과 바꾸지 않은 것
+            바꾼 것 둘이다. (1) 보내는 줄에 uuid 를 붙인다 - 그래야 CLI 가 큐
+            수명 이벤트와 result 짝짓기를 돌려준다. (2) `allow_queue` 로 턴 중
+            전송을 **선택적으로** 허용한다.
+
+            바꾸지 않은 것은 **기본 동작**이다. 인자를 주지 않으면 0.6.0 과
+            똑같이 `_busy` 에서 거부한다 - bool 로 받는 기존 호출자
+            (`plugin.py`, 하네스 07·09·12·14)의 동작이 그대로다.
+
+        왜 턴 중 전송을 열 수 있는가 (설계 2-4 의 정정)
+            "큐에 2개를 쌓지 않는다" 는 **우리가 큐를 든다**는 가정에서 나온
+            제약이었다. 실측은 반대다 - CLI 가 자기 큐를 들고 있고, 턴 중
+            stdin 에 쓰면 쌓아 두고 턴이 끝나면 스스로 다음 턴으로 실행한다.
+            그 큐가 우리에게 보이는 조건이 `queue_lifecycle` 능력이고,
+            **능력이 없으면 허용하지 않는다** - 보이지 않는 큐에 쌓으면 대기
+            건수도 취소도 말할 수 없고, 그때 동작은 0.6.0 과 같아야 한다.
+            0.6.1 V47-A07 이 여기에 런타임 축을 더했다. 선언 플래그만 보면
+            능력을 광고하지 않는 구 CLI 판본에서 조용히 깨지므로, init 을
+            본 뒤에는 광고 목록까지 보고 내린다(`lifecycle_live`).
+
+        반환 계약을 바꾸지 않은 이유
+            발급한 uuid 를 돌려주려면 반환형을 바꿔야 하고, 그러면 bool 로
+            받는 호출자가 전부 깨진다. 그래서 bool 을 유지하고 발급값은
+            `last_sent_uuid`·`sent_uuids` 로 노출한다.
+
+        Args:
+            text: 보낼 원문.
+            allow_queue: 턴이 진행 중이어도 보낼 것인가(0.6.1). 기본 False 는
+                0.6.0 동작이다. True 여도 `lifecycle_live()` 가 False 면
+                거부한다 - 어댑터 선언 플래그가 없거나, init 광고에 큐 수명
+                능력이 없는 CLI 판본일 때다(V47-A07).
 
         Returns:
             bool: 큐에 들어갔는가.
         """
         if not self.is_running() or self._write_queue is None:
             return False
-        if self._busy:
+        # 턴 중 전송을 여는 조건은 두 축이다(0.6.1 V47-A07). 선언 플래그
+        # `capabilities.queue_lifecycle` 는 "이 어댑터가 큐를 말할 줄 안다"
+        # 이고, `lifecycle_live()` 는 그 선언에 더해 init 광고까지 본다.
+        # 광고에 없으면 큐가 우리에게 보이지 않으므로 대기 건수도 취소도
+        # 말할 수 없고, 그때 동작은 0.6.0 과 같아야 한다.
+        can_queue = (allow_queue
+                     and self._backend.capabilities.queue_lifecycle
+                     and self.lifecycle_live())
+        if self._busy and not can_queue:
             return False
         if self.gate_blocked:
             # 설계 3-4 "하나라도 어긋나면 입력 박스를 열지 않는다" 의 집행 지점.
@@ -743,14 +1070,160 @@ class BackendProcess(QObject):
         if self._pending_prefix:
             body = self._pending_prefix + "\n" + text
             self._pending_prefix = None
-        payload = stream_json_user(body, backend=self._backend) + "\n"
+        # uuid 는 **선언 플래그만** 본다. 런타임으로 게이트하지 않는 이유는
+        # init 이 첫 전송 뒤에만 오기 때문이다(D06 실측) - 첫 메시지에 uuid 를
+        # 안 붙이면 그 메시지의 lifecycle 이 아예 오지 않고(uuid 없으면 CLI 가
+        # 내보내지 않는다, 실관측) 광고를 볼 기회조차 못 만든다. 광고에 없을
+        # 때는 붙은 uuid 를 **쓰지 않는 쪽**으로 내린다(lifecycle_live).
+        # 능력이 없으면 0.6.0 과 바이트 동일하다.
+        msg_uuid = (str(uuid_mod.uuid4())
+                    if self._backend.capabilities.queue_lifecycle else None)
+        payload = stream_json_user(body, backend=self._backend,
+                                   uuid=msg_uuid) + "\n"
         self._busy = True
+        if msg_uuid is not None:
+            self.last_sent_uuid = msg_uuid
+            self.sent_uuids.append(msg_uuid)
         self._write_queue.put(payload)
         if self.logbook is not None:
             self.logbook.diag(
-                "sent", "bytes=%d" % len(payload.encode("utf-8"))
+                "sent", "bytes=%d uuid=%s"
+                % (len(payload.encode("utf-8")), msg_uuid or "(none)")
             )
         return True
+
+    def send_control(self, subtype, **fields):
+        """제어 요청 한 줄을 라이터 큐에 넣는다(0.6.1).
+
+        사용자 메시지와 같은 라이터 스레드를 탄다 - 한 줄 = 한 메시지인
+        프로토콜에서 두 스레드가 쓰면 줄이 섞인다(설계 2-4).
+
+        `_busy` 를 보지 않는다. 턴 중단은 턴이 진행 중일 때만 뜻이 있고,
+        `_busy` 로 막으면 쓸 수 있는 순간에 못 보낸다.
+
+        Args:
+            subtype: 요청 종류. 이름은 어댑터가 쥔다.
+            **fields: 요청별 인자. None 인 것은 어댑터가 버린다.
+
+        Returns:
+            str: 발급한 request_id. 보내지 못했으면 빈 문자열.
+        """
+        if not self.is_running() or self._write_queue is None:
+            return ""
+        if not self._backend.capabilities.control_interrupt:
+            # 능력이 없는 백엔드에 제어 줄을 쓰면 그 줄이 사용자 메시지로
+            # 해석될 수 있다. 조용히 아무것도 하지 않는다.
+            if self.logbook is not None:
+                self.logbook.diag("control_unsupported", str(subtype))
+            return ""
+        request_id = str(uuid_mod.uuid4())
+        payload = stream_json_control(request_id, subtype,
+                                      backend=self._backend, **fields) + "\n"
+        self._pending_control[request_id] = subtype
+        self._write_queue.put(payload)
+        if self.logbook is not None:
+            self.logbook.diag(
+                "control_sent", "subtype=%s request_id=%s bytes=%d"
+                % (subtype, request_id, len(payload.encode("utf-8"))))
+        return request_id
+
+    def interrupt_turn(self, reason=None):
+        """진행 중인 턴을 제어 요청 1발로 중단한다(0.6.1).
+
+        `request_cancel()` 과 **다른 경로다. 그쪽을 대체하지 않는다.**
+        어느 것을 쓸지는 UI 단계의 결정이라 여기서는 창구만 만든다.
+
+            request_cancel()  트리 종료 + 재개 재spawn. 맥락은 `--resume`
+                              으로 살리지만 프로세스가 바뀐다
+            interrupt_turn()  같은 프로세스가 유지된다(실관측: 중단된 턴의
+                              result 뒤에 새 spawn 없이 다음 메시지가 정상
+                              처리됐다)
+
+        대기 메시지가 남는지는 **조건부다**(V47-04 정정)
+            우리 녹화 구간에서는 남았다 - 턴이 이미 스트리밍 중인 시점에
+            plain interrupt 를 보냈고, 영수증이 대기 uuid 를 `still_queued`
+            로 명시했으며 그 메시지는 뒤에 정상 실행됐다 `[실측]`.
+
+            그러나 그것을 **무조건 불변식으로 쓰면 안 된다.** 번들
+            `still_queued` describe 에 FIRST-command prewait window 가 있다
+            `[스키마]` - 세션 첫 턴이 컨트롤러를 arm 하기 전에 interrupt 가
+            들어오면 LATCH 되고, 그 doomed 작업을 들고 arm 하는 첫 턴은
+            이미 중단된 상태로 시작한다. **실사용에서 첫 메시지 직후 Stop 이
+            바로 그 창이다.** 또 `still_queued` 는 이름보다 넓어서
+            "임박한 턴을 위해 이미 dequeue 된 배치" 까지 싣는다 `[스키마]`.
+
+            조건·등급·재도출 경로는 `docs/10.cli_control_protocol_v1.md`
+            2 절(특히 "함정 - plain interrupt 도 대기 작업을 죽일 수 있다")
+            이 정본이다. 그 창의 거동 자체는 아직 `[미측]`(V47-A02)이므로
+            호출자는 "대기가 남는다" 를 전제로 UI 를 확정하지 않는다.
+
+        Args:
+            reason: 중단 사유 문자열. None 이면 키를 넣지 않는다 - 측정된
+                왕복이 인자 없는 형태였다.
+
+        Returns:
+            str: 발급한 request_id. 보내지 못했으면 빈 문자열.
+        """
+        # 런타임 하향(0.6.1 V47-A07). init 을 봤는데 영수증 능력이 광고에
+        # 없으면 보내지 않는다 - 그 판본에서 이 줄이 어떻게 읽히는지 모른다.
+        # init 전에는 선언 플래그로 시도한다(첫 턴을 막을 수 없다).
+        if not self.interrupt_live():
+            if self.logbook is not None:
+                self.logbook.diag("control_runtime_absent",
+                                  getattr(self._backend,
+                                          "runtime_cap_interrupt", ""))
+            return ""
+        return self.send_control(self._backend.control_interrupt_subtype,
+                                 reason=reason)
+
+    def cancel_queued_message(self, message_uuid):
+        """대기 중인 메시지 1건을 취소한다(0.6.1).
+
+        `interrupt_turn()` 과 **다른 요청이다.** 그쪽은 도는 턴을 멈추는
+        요청이고(대기 메시지가 남는지는 창에 따라 갈린다 - 그쪽 docstring
+        과 `docs/10.cli_control_protocol_v1.md` 2 절), 이쪽은 아직 시작하지
+        않은 메시지 1건만 지운다(영수증이 `cancelled`).
+
+        번들 describe 는 "already dequeued for execution" 이면 **no-op** 이라
+        적는다 `[스키마]`. 즉 응답 `cancelled` 가 False 로 오는 것은 실패가
+        아니라 "그 메시지는 이미 큐에 없었다" 일 수 있다.
+
+        한 발에 메시지 하나다. 여럿을 한 요청으로 묶는 형태는 측정되지
+        않았으므로 지어내지 않는다 - 호출자가 uuid 마다 부른다.
+
+        Args:
+            message_uuid: 취소할 메시지의 uuid(우리가 발급한 값).
+
+        Returns:
+            str: 발급한 request_id. 보내지 못했으면 빈 문자열.
+        """
+        if not message_uuid:
+            return ""
+        # 런타임 하향(0.6.1 V47-A07). 매핑 근거와 `[미측]` 표기는 어댑터의
+        # `CLAUDE_CAP_CANCEL_QUEUED` 주석에 있다.
+        if not self.cancel_queued_live():
+            if self.logbook is not None:
+                self.logbook.diag("control_runtime_absent",
+                                  getattr(self._backend,
+                                          "runtime_cap_cancel_queued", ""))
+            return ""
+        return self.send_control(self._backend.control_cancel_queued_subtype,
+                                 message_uuid=message_uuid)
+
+    @property
+    def interrupt_subtype(self):
+        """턴 중단 요청의 subtype 이름. 없으면 "".
+
+        호출자가 `_backend` 를 들여다보지 않게 열어 둔 창구다(docs/7 2-10
+        경계 6: 백엔드 리터럴은 어댑터가 쥔다). 상태머신에 우리 요청을
+        등록할 때 이 이름이 필요하다.
+        """
+        return getattr(self._backend, "control_interrupt_subtype", "")
+
+    @property
+    def cancel_queued_subtype(self):
+        """대기 메시지 취소 요청의 subtype 이름. 없으면 ""."""
+        return getattr(self._backend, "control_cancel_queued_subtype", "")
 
     # ------------------------------------------------------------------
     # 드레인
@@ -785,6 +1258,9 @@ class BackendProcess(QObject):
                 self._stderr_tail.append("%s %s" % (tag, line.raw))
 
         if batch:
+            # 침묵 시계의 기준. stdout 줄만 센다 - stderr 는 턴 진행의
+            # 신호가 아니다(경고가 혼자 흐를 수 있다).
+            self._last_line_mono = time.monotonic()
             self.events_drained.emit(batch)
         for raw in stderr_lines:
             self.stderr_line.emit(raw)
@@ -793,6 +1269,7 @@ class BackendProcess(QObject):
         # 경우를 위한 보조 신호이고, 남은 줄을 유실하지 않게 유예를 둔다.
         if self._stopping:
             return
+
         if died:
             self._on_death()
             return
@@ -805,8 +1282,15 @@ class BackendProcess(QObject):
         else:
             self._dead_since = None
 
+        # 고아 미결 uuid 백스톱(0.6.1 V47-A03). 매 틱 조건만 보고, 모순
+        # 상태가 유계를 넘겼을 때만 비운다. 조건은 함수 docstring 에 있다.
+        # 종료·사망 경로 **뒤에** 둔다 - 그 두 경로는 집합을 통째로 비우므로
+        # 백스톱이 끼어들 일이 없고, 끼어들면 사유가 사망인지 고아인지 로그
+        # 에서 갈리지 않는다.
+        self._sweep_orphan_pending()
+
     def _inspect(self, line):
-        """프로세스 계층이 꼭 봐야 하는 두 이벤트만 본다.
+        """프로세스 계층이 꼭 봐야 하는 네 이벤트만 본다.
 
         해석은 S3 상태머신이 한다. 여기서 보는 것은 (1) 기동 자기점검을 돌려야
         하는 세션 개시 이벤트, (2) 턴 중 입력 차단을 풀어야 하는 턴 종료
@@ -816,6 +1300,10 @@ class BackendProcess(QObject):
         Claude 는 `system/init` 과 최상위 `result` 이고, 그 판별을 어댑터에
         물어 본다 - 여기서 문자열로 비교하면 제2 백엔드가 이 함수를 고치게
         된다.
+
+        0.6.1 이 더한 둘은 공통 모델 쪽이다(`protocol.KIND_*`).
+            * 큐 수명 이벤트  미결 집합을 갱신한다. `is_busy()` 의 원천이다
+            * 제어 응답       우리 요청과 request_id 로 짝짓는다
         """
         ev = line.event
         if not isinstance(ev, dict):
@@ -823,9 +1311,221 @@ class BackendProcess(QObject):
         if self._backend.is_session_init_event(ev):
             # 원본을 먼저 보관한다. gate_result 슬롯이 이것을 읽어 탐지를 돌린다.
             self.last_init_event = ev
+            self._capture_cli_capabilities(ev)
             self._run_gate(ev)
         elif self._backend.is_turn_end_event(ev):
             self._busy = False
+            self._turn_end_count += 1
+            # 주 처방(V47-A03). 턴이 닫힐 때 그 턴이 실어 온 입력 uuid 를
+            # 미결 집합에서 정산한다. lifecycle 종결이 오지 않아도 지운다.
+            self._settle_by_result(ev)
+        elif ev.get("type") == protocol.KIND_LIFECYCLE:
+            self._on_lifecycle(ev)
+        elif ev.get("type") == protocol.KIND_CONTROL_RESPONSE:
+            self._on_control_response(ev)
+
+    def _capture_cli_capabilities(self, init_event):
+        """세션 개시 이벤트가 광고한 런타임 능력 목록을 보관한다(0.6.1).
+
+        필드가 없으면 **빈 집합**이다. 구 CLI 판본에는 이 필드가 없을 수
+        있고, 그때 "없다" 를 결함으로 읽으면 안 된다. 열린 집합이라 모르는
+        이름은 그대로 담아 두고 판정에는 쓰지 않는다.
+        """
+        names = init_event.get("capabilities")
+        # 깃발을 먼저 세운다. 필드가 없는 init 도 "init 을 봤다" 이고, 그
+        # 상태가 하향 조정의 조건이다(V47-A07).
+        self._caps_seen = True
+        if not isinstance(names, (list, tuple)):
+            self.cli_capabilities = frozenset()
+        else:
+            self.cli_capabilities = frozenset(
+                str(n) for n in names if isinstance(n, str))
+        if self.logbook is not None:
+            self.logbook.diag("cli_capabilities",
+                              "n=%d %s" % (len(self.cli_capabilities),
+                                           ",".join(sorted(self.cli_capabilities))))
+            # 하향된 축을 이름으로 적는다. 조용히 끄면 "왜 대기 표시가 없나"
+            # 를 나중에 되짚을 수 없다.
+            for axis, live in (("queue_lifecycle", self.lifecycle_live()),
+                               ("interrupt", self.interrupt_live()),
+                               ("cancel_queued", self.cancel_queued_live())):
+                if not live:
+                    self.logbook.diag(
+                        "runtime_capability_downgraded",
+                        "axis=%s wanted=%s" % (
+                            axis,
+                            getattr(self._backend,
+                                    "runtime_cap_" + axis, "") or "(none)"))
+
+    def _settle_by_result(self, result_event):
+        """턴이 닫힐 때 그 턴이 실어 온 입력 uuid 를 정산한다(0.6.1 V47-A03).
+
+        왜 이것이 주 처방인가
+            미결 집합은 lifecycle 의 `completed`/`cancelled` 로만 비는데,
+            번들에 `detachedToolCall: true` 와 "the turn can take them in as
+            any turn does" 가 있어 **큐에 쌓인 메시지가 한 턴에 접힐
+            (coalesce) 수 있다** `[스키마]`. 접힌 uuid 에 종결 이벤트가
+            오지 않으면 그 uuid 는 영구히 남고 `is_busy()` 가 영구 True 가
+            된다 - 입력이 잠긴다.
+
+            `result.user_message_uuids` 는 "이 result 가 어느 입력
+            메시지의 것인가" 를 짚는 필드이고 우리 녹화 네 회차 모두
+            **1:1 이었다** `[실측]`(docs/10 6 절). 접힘이 일어나면 흡수한
+            턴의 그 필드에 여러 uuid 가 실릴 자리이므로, 이 정산이 접힘을
+            구조적으로 흡수한다.
+
+        반대 방향 위험을 만들지 않는 이유
+            지우는 것은 **result 가 이름을 부른 uuid 뿐이다.** result 는
+            "그 입력에 대한 턴이 끝났다" 는 CLI 자신의 선언이므로, 그
+            uuid 가 아직 실행 중일 수 없다. 이름이 없는 uuid 는 손대지
+            않는다 - 그쪽은 백스톱(`_sweep_orphan_pending`)의 일이다.
+
+        Args:
+            result_event: 턴 종료 이벤트 dict.
+        """
+        got = result_event.get("user_message_uuids")
+        if not isinstance(got, (list, tuple)):
+            one = result_event.get("user_message_uuid")
+            got = [one] if isinstance(one, str) and one else []
+        settled = []
+        for msg_uuid in got:
+            if not isinstance(msg_uuid, str) or not msg_uuid:
+                continue
+            if self._pending_queue.pop(msg_uuid, None) is not None:
+                self._pending_marks.pop(msg_uuid, None)
+                settled.append(msg_uuid)
+        if settled and self.logbook is not None:
+            self.logbook.diag(
+                "settled_by_result",
+                "n=%d uuids=%s pending=%d"
+                % (len(settled), ",".join(u[:12] for u in settled),
+                   len(self._pending_queue)))
+
+    def _sweep_orphan_pending(self):
+        """진행 턴이 없는데 남은 미결 uuid 를 유계 안에서 비운다(백스톱).
+
+        `_settle_by_result` 와 **다른 조건이다.** 그쪽은 result 가 이름을
+        부른 uuid 를 지우고(끝났다는 CLI 의 선언), 이쪽은 **아무도 이름을
+        부르지 않은 채 모순 상태로 남은** uuid 를 지운다. 그래서 두 함수가
+        같은 uuid 를 두고 다투지 않는다.
+
+        모순의 정의와 두 시계
+            전제는 `_busy` 가 False 라는 것이다 - 우리가 보낸 턴의 result 를
+            아직 못 받았다면(`_busy` True) 아무것도 건드리지 않는다.
+
+                턴 시계   그 uuid 가 집합에 들어오거나 상태가 움직인 뒤로
+                          턴 종료가 `ORPHAN_PENDING_TURNS_MAX` 번 지났다.
+                          result 는 CLI 가 도는 동안 오지 않으므로 이 시계는
+                          **실행 중에 전진하지 않는다.**
+                침묵 시계 `started` 가 **하나도 없고** stdout 이
+                          `ORPHAN_PENDING_SILENCE_S` 동안 완전히 조용했다.
+                          `started` 가 있으면 CLI 가 "그것을 턴으로
+                          드레인했다" 고 말한 것이므로 침묵만으로 지우지
+                          않는다 - 긴 도구 실행이 조용할 수 있다.
+
+        조용히 지우지 않는다
+            비운 uuid 와 발화한 시계를 진단 로그에 남기고
+            `orphan_pending_cleared` 를 올린다.
+
+        Returns:
+            int: 비운 uuid 수.
+        """
+        if self._busy or not self._pending_queue:
+            return 0
+        if not self.lifecycle_live():
+            # 축이 꺼져 있으면 집합은 판정에 쓰이지 않는다. 손대지 않는다.
+            return 0
+        now = time.monotonic()
+        any_started = any(v == protocol.LIFECYCLE_STARTED
+                          for v in self._pending_queue.values())
+        silent = (self._last_line_mono is not None
+                  and not any_started
+                  and (now - self._last_line_mono) >= ORPHAN_PENDING_SILENCE_S)
+        cleared = []
+        for msg_uuid in list(self._pending_queue):
+            turn_mark, _mono = self._pending_marks.get(
+                msg_uuid, (self._turn_end_count, now))
+            turns_since = self._turn_end_count - turn_mark
+            if turns_since >= ORPHAN_PENDING_TURNS_MAX:
+                cleared.append((msg_uuid, "turns=%d" % turns_since))
+            elif silent:
+                cleared.append((msg_uuid, "silence_s=%.0f"
+                                % (now - self._last_line_mono)))
+        for msg_uuid, _why in cleared:
+            self._pending_queue.pop(msg_uuid, None)
+            self._pending_marks.pop(msg_uuid, None)
+        if cleared:
+            self.orphan_pending_cleared += len(cleared)
+            if self.logbook is not None:
+                self.logbook.diag(
+                    "orphan_pending_cleared",
+                    "n=%d %s pending=%d total=%d"
+                    % (len(cleared),
+                       " ".join("%s(%s)" % (u[:12], why) for u, why in cleared),
+                       len(self._pending_queue), self.orphan_pending_cleared))
+        return len(cleared)
+
+    def _on_lifecycle(self, ev):
+        """큐 수명 이벤트 1건으로 미결 집합을 갱신한다(0.6.1).
+
+        제거 키는 `command_uuid` 다. 줄 자신의 `uuid` 로 지우면 들어온 적
+        없는 키를 지우는 것이라 집합이 영원히 비지 않는다.
+
+        `completed`/`cancelled` 만 제거다. 번들 스키마에 적힌
+        `discarded`·`refused` 는 관측되지 않았으므로 **제거 조건에 넣지
+        않고** 그대로 들고 간다 - 관측 없이 제거 조건을 넓히면 아직 살아
+        있는 메시지를 끝난 것으로 지울 수 있다. 모르는 state 는 집합에
+        남고 진단에 기록된다.
+        """
+        info = protocol.lifecycle_info(ev)
+        if not info.command_uuid:
+            return
+        if info.state in (protocol.LIFECYCLE_COMPLETED,
+                          protocol.LIFECYCLE_CANCELLED):
+            self._pending_queue.pop(info.command_uuid, None)
+            self._pending_marks.pop(info.command_uuid, None)
+        else:
+            # 상태가 움직였으면 진전이 있었다. 백스톱 표식을 지금으로
+            # 갱신해 두면 전이가 계속되는 메시지는 백스톱에 걸리지 않는다.
+            if self._pending_queue.get(info.command_uuid) != info.state:
+                self._pending_marks[info.command_uuid] = (
+                    self._turn_end_count, time.monotonic())
+            self._pending_queue[info.command_uuid] = info.state
+            if info.state not in protocol.KNOWN_LIFECYCLE_STATES:
+                # 관측 밖의 state. 집합에 남겨 두고 사실만 적는다.
+                if self.logbook is not None:
+                    self.logbook.diag("lifecycle_unknown_state", str(info.state))
+        if self.logbook is not None:
+            self.logbook.diag(
+                "lifecycle",
+                "state=%s cmd=%s pending=%d queued=%d"
+                % (info.state, info.command_uuid[:12], len(self._pending_queue),
+                   len(self.queued_queue_uuids())))
+
+    def _on_control_response(self, ev):
+        """제어 응답을 우리 요청과 짝짓는다(0.6.1).
+
+        짝짓기 키는 `request_id` 하나다(실관측: 응답이 보낸 값을 반향한다).
+        짝이 없는 응답은 **버리지 않는다** - CLI 가 originate 하는 요청의
+        응답이 섞여 올 수 있고, 이 단계에서는 답하지 않되 관측은 남긴다.
+        """
+        info = protocol.control_response_info(ev)
+        matched = self._pending_control.pop(info.request_id, "")
+        if not matched:
+            self.unmatched_control_responses.append(ev)
+        if self.logbook is not None:
+            self.logbook.diag(
+                "control_response",
+                "request_id=%s subtype=%s matched=%s payload_keys=%s"
+                % (info.request_id or "(none)", info.subtype or "(none)",
+                   matched or "(unmatched)", ",".join(sorted(info.payload))))
+        if self.on_control_response is not None:
+            try:
+                self.on_control_response(info.request_id, info.subtype,
+                                         info.payload, matched)
+            except Exception as exc:  # noqa: BLE001 - 콜백 실패가 드레인을 멈추지 않는다
+                if self.logbook is not None:
+                    self.logbook.diag("control_callback_err", "%r" % (exc,))
 
     def _run_gate(self, init_event):
         """init 게이트를 돌리고 판정을 로그와 시그널로 낸다(설계 3-4)."""
@@ -1070,6 +1770,11 @@ class BackendProcess(QObject):
             self.logbook.diag_stderr_tail(self._stderr_tail)
         self._join_threads()
         self._busy = False
+        # 죽은 자식의 큐는 사라졌다. 비우지 않으면 is_busy() 가 재spawn 전까지
+        # 영구 True 가 되어 입력이 막힌다.
+        self._pending_queue = {}
+        self._pending_control = {}
+        self._pending_marks = {}
         self.backend_died.emit(rc if rc is not None else -1, tail)
 
         if not self._auto_restart:

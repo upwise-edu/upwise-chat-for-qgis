@@ -20,7 +20,8 @@
     Codex 는 `adapter_codex.py` 하나로 들어온다.
 
 Claude 백엔드의 능력 (docs/7 3-1 과의 대조)
-    열 플래그 전부 True 다. Codex 는 `long_lived`·`partial_deltas`·
+    열두 플래그 전부 True 다(0.6.1 에 `queue_lifecycle`·`control_interrupt`
+    두 축이 늘었고 둘 다 실측됐다). Codex 는 `long_lived`·`partial_deltas`·
     `preassigned_session_id`·`system_prompt_flag`·`plugin_dirs`·
     `skill_bundle` 이 False 또는 미검증이고, 그 차이가 docs/7 4 의
     "능력 축소 백엔드" 라는 설계 방향의 내용이다.
@@ -68,7 +69,36 @@ CLAUDE_CAPABILITIES = adapter.BackendCapabilities(
     tool_allowlist_flags=True,
     per_call_mcp_config=True,
     login_guard=True,
+    # 0.6.1 실측 2축(동결 녹화본 outputs/queue_probe_20261024_131353).
+    # 메시지에 uuid 를 붙이면 `command_lifecycle` 이 오고, control 요청의
+    # 왕복은 같은 ms 안에 돌아왔다.
+    queue_lifecycle=True,
+    control_interrupt=True,
 )
+
+# 제어 요청 subtype 리터럴(실관측). 호출자가 문자열을 들지 않게 어댑터가
+# 쥔다 - 호출자 3파일에 백엔드 리터럴을 남기지 않는 규약(docs/7 2-10)이다.
+CLAUDE_CONTROL_INTERRUPT = "interrupt"
+CLAUDE_CONTROL_CANCEL_QUEUED = "cancel_async_message"
+
+# init 이 광고하는 런타임 능력 이름(실측 13종 중 우리가 쓰는 셋).
+# 판본 추이 10종(2.1.295) -> 11종(2.1.306) -> 13종(2.1.310) 이고 번들 지시가
+# "Open set - ignore unknown values; check each capability for exactly the
+# behavior you use" 이므로, 판본을 고정하지 않고 쓰는 기능만 이름으로 본다.
+# 정본 docs/10.cli_control_protocol_v1.md 8 절.
+CLAUDE_CAP_MSG_LIFECYCLE = "msg_lifecycle_v1"
+CLAUDE_CAP_INTERRUPT_RECEIPT = "interrupt_receipt_v1"
+
+# 대기 작업 취소 축의 광고 이름. **주의: 이 매핑은 `[미측]` 추론이다.**
+# 13종 목록에 `cancel_async_message` 전용 이름이 없고, 번들 표에서
+# `interrupt_cancel_queued_v1` 은 `interrupt + cancel_queued:true` 쪽에
+# 붙는다(docs/10 2 절). 우리가 보내는 요청은 per-uuid `cancel_async_message`
+# (docs/10 3 절)이므로 둘의 동일성은 측정되지 않았다. 그래도 이 이름을 쓰는
+# 이유는 **틀렸을 때의 방향이 안전한 쪽**이기 때문이다 - 광고에 없으면 취소
+# 버튼이 아무것도 하지 않을 뿐이고(어댑터가 subtype 을 모르는 경우와 같은
+# 처분), 반대로 광고를 안 보고 보내면 구 CLI 에서 그 줄이 어떻게 읽히는지
+# 모른 채 과금 경로에 들어간다.
+CLAUDE_CAP_CANCEL_QUEUED = "interrupt_cancel_queued_v1"
 
 
 class ClaudeAdapter(adapter.BackendAdapter):
@@ -187,22 +217,91 @@ class ClaudeAdapter(adapter.BackendAdapter):
         """저장된 모델 선택을 `--model` 값으로. 기본 선택이면 None(F6)."""
         return posture.model_arg(posture.read_model_choice())
 
-    def serialize_user_input(self, text):
+    def serialize_user_input(self, text, uuid=None):
         """stream-json 의 user 메시지 한 줄(설계 2-4).
 
         `process.stream_json_user` 와 같은 형식이고, 그 함수가 이제 이
         메서드로 위임한다 - 직렬화 포맷은 백엔드 고유 지식이다
         (docs/7 2-10 경계 6).
+
+        uuid 를 붙이는 이유
+            CLI 2.1.310 은 자기 메시지 큐를 들고 있는데, **uuid 가 없으면
+            `command_lifecycle` 을 내보내지 않는다**(실관측). 0.6.0 까지
+            이 함수가 uuid 를 안 붙여서 큐가 보이지 않았다. 또 `result` 의
+            `user_message_uuids` 가 메시지와 턴을 1:1 로 짝지어 주는데,
+            그 짝짓기도 uuid 가 있어야 성립한다.
+
+        키 순서를 녹화본과 같게 둔 이유
+            동결 녹화본의 stdin 이 `type`·`uuid`·`message`·
+            `parent_tool_use_id` 순이었고, 그 바이트로 큐 동작이 측정됐다.
+            순서가 의미를 갖는다는 근거는 없지만 측정된 형태를 바꿀 이유도
+            없다.
+
+        Args:
+            text: 사용자 입력 원문.
+            uuid: 붙일 클라이언트 식별자. None 이면 0.6.0 과 **바이트
+                동일**한 줄이 나온다(키를 아예 넣지 않는다).
+
+        Returns:
+            str: 개행 없는 한 줄.
         """
         import json
 
+        payload = {"type": "user"}
+        if uuid is not None:
+            payload["uuid"] = uuid
+        payload["message"] = {"role": "user",
+                              "content": [{"type": "text", "text": text}]}
+        payload["parent_tool_use_id"] = None
+        return json.dumps(payload, ensure_ascii=False)
+
+    control_interrupt_subtype = CLAUDE_CONTROL_INTERRUPT
+    control_cancel_queued_subtype = CLAUDE_CONTROL_CANCEL_QUEUED
+
+    # 런타임 광고 이름(0.6.1, V47-A07). 선언 플래그와 다른 축이고,
+    # 프로세스 계층이 init 광고에서 이 이름들을 찾아 하향 조정한다.
+    runtime_cap_queue_lifecycle = CLAUDE_CAP_MSG_LIFECYCLE
+    runtime_cap_interrupt = CLAUDE_CAP_INTERRUPT_RECEIPT
+    runtime_cap_cancel_queued = CLAUDE_CAP_CANCEL_QUEUED
+
+    def serialize_control_request(self, request_id, subtype, **fields):
+        """stream-json 의 control_request 한 줄(0.6.1 실관측 축자).
+
+            {"type":"control_request","request_id":"<보내는 쪽 지정>",
+             "request":{"subtype":"interrupt"}}
+
+        응답은 같은 `request_id` 를 반향한다 - 그것이 짝짓기 키다.
+
+        None 인 선택 인자를 버리는 이유
+            측정된 왕복은 **인자 없는 interrupt** 였다(응답이 대기 메시지를
+            `still_queued` 로 명시했고 지우지 않았다). `cancel_queued=None`
+            을 null 로 실어 보내면 그 요청은 측정된 형태와 다른 바이트가
+            되고, CLI 가 null 을 어떻게 읽는지는 측정하지 않았다.
+
+        Args:
+            request_id: 이 요청의 식별자.
+            subtype: `interrupt` 또는 `cancel_async_message`.
+            **fields: 요청별 인자. interrupt 는 `cancel_queued`(bool)·
+                `send_now`(bool)·`message_uuid`(str)·`reason`(str) 이
+                선택이고, `cancel_async_message` 는 `message_uuid` 가
+                필수다. None 인 것은 키 자체를 넣지 않는다.
+
+        Returns:
+            str: 개행 없는 한 줄.
+        """
+        import json
+
+        request = {"subtype": subtype}
+        # 키 순서를 재현 가능하게 둔다. dict 순서가 바이트에 그대로 나오므로
+        # 정렬하지 않으면 호출마다 다른 줄이 날 수 있다(kwargs 순서 의존).
+        for key in sorted(fields):
+            value = fields[key]
+            if value is None:
+                continue
+            request[key] = value
         return json.dumps(
-            {
-                "type": "user",
-                "message": {"role": "user",
-                            "content": [{"type": "text", "text": text}]},
-                "parent_tool_use_id": None,
-            },
+            {"type": "control_request", "request_id": request_id,
+             "request": request},
             ensure_ascii=False,
         )
 

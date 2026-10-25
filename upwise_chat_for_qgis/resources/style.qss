@@ -521,6 +521,7 @@ QFrame[upwiseRole="divider"] {
 #UpwiseChatExclusionBar,
 #UpwiseChatStaleBar,
 #UpwiseChatWatchdogBar,
+#UpwiseChatQueueBar,
 #UpwiseChatSkillMarkerBar,
 #UpwiseChatPostureConfirmBar,
 #UpwiseChatExportBar {

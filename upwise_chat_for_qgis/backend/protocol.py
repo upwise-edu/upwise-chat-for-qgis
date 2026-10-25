@@ -45,6 +45,42 @@ KIND_RATE_LIMIT = "rate_limit_event"
 KIND_NONJSON = "nonjson"
 KIND_UNKNOWN = "unknown"
 
+# 0.6.1 에 승격된 두 최상위 type.
+#
+# 왜 승격하는가
+#     둘 다 CLI 2.1.310 에서 실관측됐고(동결 녹화본
+#     outputs/queue_probe_20261024_131353), 지금까지 KIND_UNKNOWN 으로
+#     떨어져 상태머신의 `unknown_types` 카운터를 올렸다. 우리가 보내는
+#     user 줄에 최상위 `uuid` 를 붙이는 순간 `command_lifecycle` 이 메시지
+#     1건당 2~3줄씩 쏟아지므로, 승격하지 않으면 "미지 이벤트 0건" 을
+#     단정하는 하네스가 전부 거짓 red 가 된다.
+KIND_LIFECYCLE = "command_lifecycle"
+KIND_CONTROL_RESPONSE = "control_response"
+
+# `command_lifecycle.state` 실관측 4종(동결 녹화본 round1/round2).
+#
+# 번들 스키마에는 `discarded`·`refused` 도 적혀 있지만 **관측되지 않았다.**
+# 그래서 "아는 것" 목록에만 넣고, 이 목록 밖의 state 는 미결 집합에서
+# 무시하지 않고 그대로 들고 간다(열린 집합 취급).
+LIFECYCLE_QUEUED = "queued"
+LIFECYCLE_STARTED = "started"
+LIFECYCLE_COMPLETED = "completed"
+LIFECYCLE_CANCELLED = "cancelled"
+KNOWN_LIFECYCLE_STATES = (LIFECYCLE_QUEUED, LIFECYCLE_STARTED,
+                          LIFECYCLE_COMPLETED, LIFECYCLE_CANCELLED)
+
+# 미결(아직 끝나지 않은) 상태들. 이 둘에 있는 uuid 가 "CLI 가 아직 들고
+# 있는 메시지" 다.
+LIFECYCLE_OPEN_STATES = (LIFECYCLE_QUEUED, LIFECYCLE_STARTED)
+
+# 중단된 턴의 result subtype(실관측 round2 L20).
+#
+# 그 줄은 `is_error=true`·`result` 키 부재·`total_cost_usd=0`·
+# `terminal_reason="aborted_streaming"` 이었고, **그 뒤 새 spawn 없이**
+# 같은 프로세스가 다음 메시지를 정상 처리했다. 그래서 이 subtype 하나만
+# 보고 백엔드 사망으로 분류하면 안 된다(machine 이 그 판정을 한다).
+RESULT_SUBTYPE_ABORTED = "error_during_execution"
+
 # 실측으로 확인된 system subtype 4종(S2). "아는 것" 목록일 뿐이고 이 목록 밖이
 # 오면 무시 + 기록이다. 예외를 던지지 않는다.
 KNOWN_SYSTEM_SUBTYPES = ("init", "status", "permission_denied", "thinking_tokens")
@@ -99,6 +135,24 @@ StreamInfo = collections.namedtuple(
     "StreamInfo", "etype index delta_type delta_text content_block message_id"
 )
 
+#: `command_lifecycle` 한 건.
+#:
+#: command_uuid  **우리가 user 줄에 붙인 uuid.** 이것이 메시지 식별자다
+#:               (줄 자신의 `uuid` 와 다르다 - 혼동하면 미결 집합이 영구히
+#:               비지 않는다)
+#: state         "queued"/"started"/"completed"/"cancelled" 실관측
+#: uuid          lifecycle 줄 자신의 uuid. 중복 수신 판별에만 쓴다
+LifecycleInfo = collections.namedtuple("LifecycleInfo", "command_uuid state uuid")
+
+#: `control_response` 한 건.
+#:
+#: request_id  **보내는 쪽이 정한 값이 반향된다.** 짝짓기의 유일한 키다
+#: subtype     "success" 또는 그 외(실관측은 success 만)
+#: payload     내부 `response` dict. interrupt 영수증은 여기에
+#:             `still_queued` 가, cancel 영수증은 `cancelled` 가 들어온다
+ControlResponseInfo = collections.namedtuple(
+    "ControlResponseInfo", "request_id subtype payload")
+
 
 class ParsedLine(object):
     """stdout 한 줄의 분류 결과.
@@ -118,10 +172,24 @@ class ParsedLine(object):
         "stream",
         "oversize",
         "raw_bytes",
+        "uuid",
+        "info",
     )
 
     def __init__(self, ts, raw, event, kind, subtype="", session_id="",
-                 blocks=(), stream=None, oversize=False, raw_bytes=0):
+                 blocks=(), stream=None, oversize=False, raw_bytes=0,
+                 uuid="", info=None):
+        """한 줄의 분류 결과를 담는다.
+
+        Args:
+            uuid: 최상위 `uuid` 원값(0.6.1). 재방출 user 줄이 **우리가 발급한
+                것인가** 를 가르는 유일한 단서다 - CLI 가 interrupt 직후
+                합성 user 줄을 자기 uuid 로 방출하므로(실관측 round2 L14),
+                우리 발급 집합에 없는 uuid 가 곧 CLI 생성분이다.
+            info: 종류별 부가 정보. `KIND_LIFECYCLE` 이면 `LifecycleInfo`,
+                `KIND_CONTROL_RESPONSE` 이면 `ControlResponseInfo`.
+                그 외에는 None 이다.
+        """
         self.ts = ts
         self.raw = raw
         self.event = event
@@ -132,6 +200,8 @@ class ParsedLine(object):
         self.stream = stream
         self.oversize = oversize
         self.raw_bytes = raw_bytes
+        self.uuid = uuid
+        self.info = info
 
     def __repr__(self):
         return "<ParsedLine %s/%s blocks=%d>" % (self.kind, self.subtype, len(self.blocks))
@@ -163,33 +233,107 @@ def parse(raw, ts=None, event=_UNSET):
 
     etype = event.get("type")
     session_id = event.get("session_id") or ""
+    # 최상위 uuid 는 종류를 가리지 않고 꺼낸다. 문자열이 아닌 값이 와도
+    # 호출자가 isinstance 검사를 또 하지 않게 여기서 빈 문자열로 접는다.
+    line_uuid = event.get("uuid")
+    line_uuid = line_uuid if isinstance(line_uuid, str) else ""
 
     if etype == "system":
         subtype = event.get("subtype") or ""
         kind = KIND_SYSTEM if subtype in KNOWN_SYSTEM_SUBTYPES else KIND_UNKNOWN
         return ParsedLine(ts, raw, event, kind, subtype, session_id,
-                          raw_bytes=raw_bytes, oversize=oversize)
+                          raw_bytes=raw_bytes, oversize=oversize, uuid=line_uuid)
 
     if etype in ("assistant", "user"):
         kind = KIND_ASSISTANT if etype == "assistant" else KIND_USER
         return ParsedLine(ts, raw, event, kind, "", session_id,
-                          blocks=content_blocks(event), raw_bytes=raw_bytes, oversize=oversize)
+                          blocks=content_blocks(event), raw_bytes=raw_bytes,
+                          oversize=oversize, uuid=line_uuid)
 
     if etype == "stream_event":
         return ParsedLine(ts, raw, event, KIND_STREAM, "", session_id,
-                          stream=stream_info(event), raw_bytes=raw_bytes, oversize=oversize)
+                          stream=stream_info(event), raw_bytes=raw_bytes,
+                          oversize=oversize, uuid=line_uuid)
 
     if etype == "result":
         return ParsedLine(ts, raw, event, KIND_RESULT, event.get("subtype") or "", session_id,
-                          raw_bytes=raw_bytes, oversize=oversize)
+                          raw_bytes=raw_bytes, oversize=oversize, uuid=line_uuid)
 
     if etype == "rate_limit_event":
         return ParsedLine(ts, raw, event, KIND_RATE_LIMIT, "", session_id,
-                          raw_bytes=raw_bytes, oversize=oversize)
+                          raw_bytes=raw_bytes, oversize=oversize, uuid=line_uuid)
+
+    # 큐 수명 이벤트. subtype 자리에 state 를 넣어 두면 상태머신이 다른
+    # 종류와 같은 모양으로 분기할 수 있다.
+    if etype == KIND_LIFECYCLE:
+        info = lifecycle_info(event)
+        return ParsedLine(ts, raw, event, KIND_LIFECYCLE, info.state, session_id,
+                          raw_bytes=raw_bytes, oversize=oversize,
+                          uuid=line_uuid, info=info)
+
+    # 제어 응답. session_id 가 실려 오지 않는다(실관측) - 짝짓기 키는
+    # request_id 하나다.
+    if etype == KIND_CONTROL_RESPONSE:
+        info = control_response_info(event)
+        return ParsedLine(ts, raw, event, KIND_CONTROL_RESPONSE, info.subtype,
+                          session_id, raw_bytes=raw_bytes, oversize=oversize,
+                          uuid=line_uuid, info=info)
 
     # 모르는 최상위 type. 버전업 내구성을 위해 통과시킨다.
     return ParsedLine(ts, raw, event, KIND_UNKNOWN, str(etype or ""), session_id,
-                      raw_bytes=raw_bytes, oversize=oversize)
+                      raw_bytes=raw_bytes, oversize=oversize, uuid=line_uuid)
+
+
+def lifecycle_info(event):
+    """`command_lifecycle` 한 건을 LifecycleInfo 로 접는다.
+
+    `command_uuid` 가 **우리가 붙인 메시지 uuid** 이고 `uuid` 는 lifecycle
+    줄 자신의 것이다. 둘을 바꿔 쓰면 미결 집합에서 제거가 영원히 일어나지
+    않는다(제거 키가 들어온 적 없는 값이 되므로).
+
+    Returns:
+        LifecycleInfo. 어떤 입력에도 예외를 던지지 않는다.
+    """
+    if not isinstance(event, dict):
+        return LifecycleInfo("", "", "")
+    cmd = event.get("command_uuid")
+    state = event.get("state")
+    own = event.get("uuid")
+    return LifecycleInfo(
+        cmd if isinstance(cmd, str) else "",
+        state if isinstance(state, str) else "",
+        own if isinstance(own, str) else "",
+    )
+
+
+def control_response_info(event):
+    """`control_response` 한 건을 ControlResponseInfo 로 접는다.
+
+    축자 형태는 이중 중첩이다(실관측).
+
+        {"type":"control_response",
+         "response":{"subtype":"success","request_id":"...",
+                     "response":{"still_queued":["..."]}}}
+
+    바깥 `response` 는 봉투이고 안쪽 `response` 가 영수증 본문이다. 안쪽이
+    없는 응답도 있을 수 있으므로 빈 dict 로 접는다.
+
+    Returns:
+        ControlResponseInfo. 어떤 입력에도 예외를 던지지 않는다.
+    """
+    if not isinstance(event, dict):
+        return ControlResponseInfo("", "", {})
+    envelope = event.get("response")
+    if not isinstance(envelope, dict):
+        return ControlResponseInfo("", "", {})
+    rid = envelope.get("request_id")
+    subtype = envelope.get("subtype")
+    payload = envelope.get("response")
+    return ControlResponseInfo(
+        rid if isinstance(rid, str) else "",
+        subtype if isinstance(subtype, str) else "",
+        payload if isinstance(payload, dict) else {},
+    )
 
 
 def from_stream_line(line):
