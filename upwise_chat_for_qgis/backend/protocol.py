@@ -81,9 +81,19 @@ LIFECYCLE_OPEN_STATES = (LIFECYCLE_QUEUED, LIFECYCLE_STARTED)
 # 보고 백엔드 사망으로 분류하면 안 된다(machine 이 그 판정을 한다).
 RESULT_SUBTYPE_ABORTED = "error_during_execution"
 
-# 실측으로 확인된 system subtype 4종(S2). "아는 것" 목록일 뿐이고 이 목록 밖이
+# 실측으로 확인된 system subtype. "아는 것" 목록일 뿐이고 이 목록 밖이
 # 오면 무시 + 기록이다. 예외를 던지지 않는다.
-KNOWN_SYSTEM_SUBTYPES = ("init", "status", "permission_denied", "thinking_tokens")
+#
+# 0.6.2 에 뒤 두 개를 승격했다(0.6.1 의 command_lifecycle·control_response
+# 승격과 같은 축). 둘 다 동결 녹화본
+# outputs/tool_turn_probe_20261029_223633/run/stream.jsonl L28/L29 에서
+# `type="system"` 으로 실관측됐고(task_started 는 description·task_type·
+# is_backgrounded, task_notification 은 status·summary·output_file 을 싣는다),
+# 그동안 KIND_UNKNOWN 으로 떨어져 "미지 subtype 0건" 을 단정하는 하네스를
+# 거짓 red 로 만들 수 있었다. 백그라운드 도구를 쓰는 턴마다 온다.
+KNOWN_SYSTEM_SUBTYPES = ("init", "status", "permission_denied",
+                         "thinking_tokens", "task_started",
+                         "task_notification")
 
 # 렌더 상한(설계 4-4).
 # 한 줄이 이보다 크면 파싱은 하되 렌더는 요약만 한다. 읽기를 자르면 JSON 이 깨진다.

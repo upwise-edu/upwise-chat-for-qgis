@@ -71,6 +71,49 @@ TOOL_SEARCH_NAME = adapter_registry.default().tool_search_tool_name
 # 그래서 제외만 본문 문자열로 가른다 - 그것이 유일한 신호다.
 EXCLUSION_MARKER = adapter_registry.default().exclusion_marker
 
+# 비실행 종류 중 "사용자가 승인하지 않았다" 를 뜻하는 값(실관측).
+# 표시 계층이 이 값만 "사용자 거부" 로 가른다 - 목록 밖의 값은 들고만 있는다.
+NON_EXECUTION_USER_REJECTED = "user-rejected"
+
+
+def non_execution_kind_of(event, tool_use_id):
+    """user 줄이 알려 준 "도구가 실행되지 않은 이유" 를 꺼낸다.
+
+    왜 최상위에서 읽는가
+        `tool_result_meta` 와 `tool_use_result` 는 content 블록이 아니라
+        **user 줄 최상위**에 온다(동결 녹화본
+        outputs/tool_turn_probe_20261029_223633/run/stream.jsonl L80 실측).
+        블록만 뒤지면 못 집는다.
+
+    왜 .get() 으로 읽는가
+        정상 종료한 도구도 최상위 meta 를 들고 오지만 그때는
+        `non_execution_kind` **키가 아예 없다**(null 이 아니다. 같은 녹화본
+        L30 은 `permission_decision` 만 싣는다). 키 부재와 null 을 같은
+        것으로 두면 "없음" 을 값으로 오해한다.
+
+    Args:
+        event: user 줄 원문 dict.
+        tool_use_id: 결과를 받은 도구 호출 id. 빈 문자열이면 id 를 가리지
+            않고 첫 값을 쓴다(고아 tool_result 경로).
+
+    Returns:
+        str: 종류 문자열. 없으면 "".
+    """
+    if not isinstance(event, dict):
+        return ""
+    metas = event.get("tool_result_meta")
+    if not isinstance(metas, list):
+        return ""
+    for meta in metas:
+        if not isinstance(meta, dict):
+            continue
+        if tool_use_id and meta.get("id") != tool_use_id:
+            continue
+        kind = meta.get("non_execution_kind")
+        if isinstance(kind, str) and kind:
+            return kind
+    return ""
+
 
 class RenderBlock(object):
     """전사에 그려지는 블록 1개.
@@ -132,7 +175,8 @@ class ToolCard(object):
 
     __slots__ = ("tool_use_id", "name", "tool_input", "result_raw", "result_display",
                  "result_truncated", "strip_applied", "strip_reason", "is_error",
-                 "denied", "excluded", "closed", "orphan", "stage")
+                 "denied", "excluded", "closed", "orphan", "stage",
+                 "non_execution_kind")
 
     def __init__(self, tool_use_id, name, tool_input, tool_search_name=None):
         """카드 하나를 연다.
@@ -155,6 +199,11 @@ class ToolCard(object):
         self.strip_reason = ""
         self.is_error = None
         self.denied = False
+        # 0.6.2: 도구가 **실행되지 않은** 이유. CLI 가 user 줄 최상위
+        # `tool_result_meta[].non_execution_kind` 로 알려 준다(실관측
+        # "user-rejected"). 키가 없으면 빈 문자열이다 - 표시 계층이
+        # "사용자 거부" 와 "도구 오류" 를 가르는 데만 쓴다.
+        self.non_execution_kind = ""
         # 제외는 거부가 아니다. 카드 제목과 바 문구가 갈라져야 한다(설계 3-5).
         self.excluded = False
         self.closed = False
@@ -753,6 +802,11 @@ class TurnMachine(object):
         card.result_display, card.result_truncated = (
             self._backend.truncate_for_render(display))
         card.is_error = block.is_error
+        # 0.6.2: 같은 is_error=true 안에 "사용자가 승인하지 않았다" 와 "도구가
+        # 실패했다" 가 섞여 있다. 최상위 meta 가 그것을 갈라 주므로 카드에
+        # 들고만 있는다 - 거부 장부(turn.denials)와 안내 바는 그대로 둔다.
+        # 그쪽은 permission_denied 이벤트를 1차 신호로 쓰는 감사 경로다.
+        card.non_execution_kind = non_execution_kind_of(parsed.event, cid)
         card.closed = True
         if block.is_error:
             # 2차 신호. 아직 사유가 안 채워진 거부 시도에 전문을 붙인다(설계 3-5).

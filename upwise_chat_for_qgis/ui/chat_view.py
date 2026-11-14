@@ -155,6 +155,9 @@ from qgis.PyQt.QtWidgets import (
 
 from ..backend import protocol
 from ..backend import transcript as transcript_mod
+# 비실행 종류 리터럴은 상태머신이 정본이다. 여기서 다시 적으면 한쪽만 바뀐다
+# (machine.py 의 TOOL_SEARCH_NAME 주석과 같은 축).
+from ..backend.machine import NON_EXECUTION_USER_REJECTED
 from . import theme as theme_mod
 
 # 전사에 위젯으로 유지하는 블록 수 상한(설계 4-4). protocol 의 값을 그대로 쓴다.
@@ -666,8 +669,16 @@ class ToolCardWidget(QFrame):
             # 제외는 거부가 아니다. 사용자가 "허용" 으로 풀 수 없는 상태이므로
             # 제목에서도 갈라 쓴다(설계 3-5).
             state = "포스처에 없음"
+        elif (getattr(card, "non_execution_kind", "")
+                == NON_EXECUTION_USER_REJECTED):
+            # 0.6.2: 사용자가 승인하지 않아 **실행되지 않은** 도구다. 지금까지는
+            # is_error 만 보고 "오류" 로 적었는데, 그러면 사용자가 자기 결정을
+            # 고장으로 읽는다. permission_denied 이벤트가 0건인 경로에서도
+            # 오므로(2026-10-29 녹화본) `denied` 로는 안 걸린다.
+            state = "사용자 거부"
         elif card.closed and card.is_error:
-            state = "오류"
+            # 위 분기를 지난 is_error 는 도구 자신이 실패한 것이다.
+            state = "도구 오류"
         elif card.closed:
             state = "완료"
         else:

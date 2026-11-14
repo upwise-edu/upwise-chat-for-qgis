@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.6.2
+
+Two readings in the dock were wrong, and both were wrong in the same way: a
+field was taken for something it is not. The usage card added up a running
+total, and a tool the user declined was reported as a tool that failed.
+
+- **The usage card no longer overstates the cost.** `result.total_cost_usd` is
+  not the cost of that turn; it is the cost of the session so far. A recording
+  of one session shows the three `result` lines carrying 0.471981, 0.489733
+  and 0.501717, with the token counts in `modelUsage` accumulating as well.
+  The card used to add each of those, so a conversation of several turns read
+  high (2.92 times the real figure in the measured session). The card now
+  tracks the latest figure for the running session and folds the previous
+  figure into a carried total only when the session changes, so the caption
+  ("this conversation so far") keeps its meaning across a backend restart. A
+  session boundary is read from the session id, and from a figure that falls,
+  since a session total cannot go down.
+- **A tool the user did not approve reads as rejected, not failed.** The CLI
+  marks that case on the user line itself, in
+  `tool_result_meta[].non_execution_kind`, with the key absent rather than
+  null when the tool did run. Both outcomes arrive as `is_error`, so the card
+  used to title them both "error". The tool card now says "user rejected" for
+  the first and "tool error" for the second. This is a display change only:
+  the denial record a turn keeps, the approval bar and the session recording
+  are untouched.
+- **`task_started` and `task_notification` are known events.** Both were
+  observed as `system` subtypes and both had been falling through to the
+  unknown counter, which any check asserting "no unknown events" would have
+  read as a regression. They are now in the known list - the same kind of
+  promotion 0.6.1 gave `command_lifecycle` and `control_response`, which
+  became first-class top-level kinds rather than entries in this list.
+
 ## 0.6.1
 
 Typing while a turn runs. The dock now follows the Claude Code interactive

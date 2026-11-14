@@ -4,7 +4,9 @@
 
     UsageCard    사용 한도와 비용. 스트림의 `rate_limit_event` 가 싣고 오는
                  5시간/7일 utilization 두 값과, `result` 이벤트의
-                 `total_cost_usd` 를 이 대화 동안 더한 값이다.
+                 `total_cost_usd` 로 만든 이 대화 누적 비용이다. 그 필드는
+                 턴 하나의 값이 아니라 **세션 누적**이라 더하지 않는다
+                 (`UsageCard.add_cost` docstring 의 실측).
     CollectCard  제공자별 수집 회차. 프로필 workspace 아래 `collected/` 의
                  사이드카(`collect_meta.json`)를 세어 만든다.
 
@@ -65,7 +67,7 @@ USAGE_COST_VALUE_FMT = "$%.4f"
 USAGE_EMPTY = "아직 사용량 정보가 없습니다. 답변을 한 번 받으면 표시됩니다."
 USAGE_TIP = (
     "Claude 가 보내 주는 사용 한도 정보입니다. 5시간 창과 7일 창의 사용 "
-    "비율이고, 비용은 이번 대화에서 받은 응답들의 합입니다."
+    "비율이고, 비용은 이번 대화에서 지금까지 쓴 금액입니다."
 )
 
 COLLECT_CARD_TITLE = "수집 통계"
@@ -214,7 +216,11 @@ def usage_from_event(event):
 
 
 def cost_from_event(event):
-    """`result` 한 건의 비용(USD). 없으면 None.
+    """`result` 한 건이 싣고 온 `total_cost_usd`. 없으면 None.
+
+    **이 값은 그 턴의 비용이 아니라 세션 누적**이다(V52 B7 실측). 파서는
+    원문을 그대로 돌려주고, 누계로 접는 규칙은 `UsageCard.add_cost` 가
+    맡는다 - 파서가 차액을 계산하면 한 건만 놓쳐도 영구히 틀어진다.
 
     Args:
         event: 스트림 이벤트 dict.
@@ -385,8 +391,15 @@ class UsageCard(_ChartCard):
                          USAGE_EMPTY, parent)
         self._five_hour = None
         self._seven_day = None
+        # 카드에 찍히는 값. 항상 `_cost_carried + _cost_session` 이다.
         self._cost_usd = 0.0
         self._cost_turns = 0
+        # 끝난 세션들의 마지막 누적값 합. 백엔드가 재시작하면 이쪽으로 접는다.
+        self._cost_carried = 0.0
+        # 현 세션의 누적값(result 의 total_cost_usd 최신값). 더하지 않는다.
+        self._cost_session = 0.0
+        # 현 세션 식별자. None 은 "아직 어느 세션도 못 봤다" 다.
+        self._cost_session_id = None
 
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
@@ -465,18 +478,87 @@ class UsageCard(_ChartCard):
             self._show_empty(False)
         return got
 
-    def add_cost(self, usd):
-        """턴 하나의 비용을 더한다.
+    def _fold_session(self, session_id):
+        """세션 경계. 직전 세션 누적을 누계에 접고 현 세션을 0 으로 둔다.
 
         Args:
-            usd: 이번 턴의 USD 비용.
+            session_id: 새 세션 식별자. None 이면 식별자 미상으로 둔다.
 
         Returns:
-            float: 누적 비용.
+            float: 접은 뒤의 누계(끝난 세션들의 합).
+        """
+        self._cost_carried += self._cost_session
+        self._cost_session = 0.0
+        self._cost_session_id = session_id
+        return self._cost_carried
+
+    def note_session(self, session_id):
+        """`system`/`init` 이 알려 준 세션 식별자를 받아 둔다.
+
+        백엔드가 재시작하거나 CLI 가 새 세션을 열면 `total_cost_usd` 가 0 부터
+        다시 센다고 본다 - **미측 전제**다(세션 두 개가 비용을 싣는 실녹화가
+        아직 없다, V54-02. 새 세션이 0 이 아니라 이어받는다면 접기는 과대로
+        기운다). 그 경계를 init 에서 먼저 잡아 두면 새 세션의 첫 result 가
+        오기 전에도 카드가 맞는다.
+
+        **같은 세션 id 로 오는 init 은 경계가 아니다.** 녹화본
+        s2_live_261010_005950.jsonl 은 한 세션 안에서 init 을 두 번 싣고
+        (L1, L42) 그 뒤 result 의 누적이 계속 커진다 - init 만 보고 접으면
+        같은 세션 비용을 두 번 센다.
+
+        Args:
+            session_id: `session_id` 원문. None 이면 아무것도 하지 않는다.
+
+        Returns:
+            bool: 세션 경계로 판정했는가.
+        """
+        if session_id is None or session_id == self._cost_session_id:
+            return False
+        if self._cost_session_id is None:
+            # 첫 세션. 접을 직전 값이 없다.
+            self._cost_session_id = session_id
+            return False
+        self._fold_session(session_id)
+        self._refresh_text()
+        return True
+
+    def add_cost(self, usd, session_id=None):
+        """`result` 가 싣고 온 세션 누적 비용을 카드에 반영한다.
+
+        왜 더하지 않는가
+            `result.total_cost_usd` 는 그 턴 하나의 비용이 아니라 **세션
+            누적**이다(V52 B7 실측: 한 세션의 result 3건이 0.471981 ->
+            0.489733 -> 0.501717 로 커지고 modelUsage 토큰도 같이 누적된다).
+            result 마다 더하면 턴 수에 따라 과대해진다(실측 2.92배).
+
+        그래서 현 세션분은 **최신값**으로 두고, 세션이 바뀔 때만 직전 값을
+        누계에 접는다. 카드 문구("이번 대화 누적")의 뜻은 그대로다.
+
+        세션 경계는 두 축으로 가른다. ① 식별자가 바뀌었다. ② 식별자를 못
+        싣는 경로에서 값이 **줄었다** - 세션 누적은 단조 증가라 감소를
+        설명하는 것은 새 세션뿐이다.
+
+        Args:
+            usd: `result` 의 `total_cost_usd` 원문.
+            session_id: 그 result 의 `session_id`. None 이면 현 세션으로 본다.
+
+        Returns:
+            float: 카드에 찍히는 누적 비용.
         """
         if usd is None:
             return self._cost_usd
-        self._cost_usd += float(usd)
+        value = float(usd)
+        key = self._cost_session_id if session_id is None else session_id
+        # 감소를 경계로 읽는 것은 식별자를 못 싣는 경로뿐이다(docstring 축 2).
+        # 식별자가 같은데 값이 준 경우까지 접으면 직전 값이 누계로 더해져
+        # 0.6.1 과 같은 방향의 과대가 된다(V54 P2-1).
+        if key != self._cost_session_id or (
+                session_id is None and value < self._cost_session):
+            self._fold_session(key)
+        # 같은 세션에서 역주행한 result 가 와도 최댓값을 지킨다(순서 보장이
+        # 없는 드레인 배치에서 카드가 뒤로 가지 않게).
+        self._cost_session = max(self._cost_session, value)
+        self._cost_usd = self._cost_carried + self._cost_session
         self._cost_turns += 1
         self._refresh_text()
         # 비용만 와도 보여 줄 것이 생긴다. 한도 정보가 늦게 오는 회차에서
@@ -498,6 +580,11 @@ class UsageCard(_ChartCard):
         self._seven_day = self.seven_day_bar.set_ratio(None)
         self._cost_usd = 0.0
         self._cost_turns = 0
+        # 세션 추적도 함께 비운다. 새 대화는 새 세션을 열고, 그 init 을
+        # 경계로 다시 세기 시작해야 한다.
+        self._cost_carried = 0.0
+        self._cost_session = 0.0
+        self._cost_session_id = None
         self._refresh_text()
         self._show_empty(True)
         return self._cost_usd
@@ -528,8 +615,12 @@ class UsageCard(_ChartCard):
             elif etype == "result":
                 usd = cost_from_event(event)
                 if usd is not None:
-                    self.add_cost(usd)
+                    self.add_cost(usd, event.get("session_id"))
                     cost_n += 1
+            elif etype == "system" and event.get("subtype") == "init":
+                # 세션 경계 후보. 비용 이벤트가 아니므로 셈에 넣지 않는다 -
+                # `cost_events` 는 "턴이 몇 번 끝났나" 를 세는 창구다.
+                self.note_session(event.get("session_id"))
         return rate_n, cost_n
 
     def stats(self):
