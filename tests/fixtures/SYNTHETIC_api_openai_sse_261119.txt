@@ -1,0 +1,10 @@
+data: {"id":"chatcmpl-synth-261119","object":"chat.completion.chunk","created":1763500000,"model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-synth-261119","object":"chat.completion.chunk","created":1763500000,"model":"gpt-5","choices":[{"index":0,"delta":{"content":"이 창은 채팅 전용입니다. "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-DIFFERENT-id-261119","object":"chat.completion.chunk","created":1763500001,"model":"gpt-5","choices":[{"index":0,"delta":{"content":"레이어 목록을 읽을 수 없습니다."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-synth-261119","object":"chat.completion.chunk","created":1763500002,"model":"gpt-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

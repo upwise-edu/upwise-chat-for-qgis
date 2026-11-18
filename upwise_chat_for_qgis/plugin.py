@@ -58,8 +58,9 @@ from qgis.PyQt.QtGui import QIcon
 # 선언하기 전에 이 import 경로를 재확인한다.
 from qgis.PyQt.QtWidgets import QAction
 
-from .backend import (adapter_registry, detect, embedded, keystore, posture,
-                      process, skillbundle)
+from .backend import (adapter_api, adapter_registry, apibackend, detect,
+                      embedded, keystore, llmkeys, posture, process,
+                      skillbundle)
 from .backend.logbook import qgis_profile_root
 from .ui.dock import UpwiseChatDock
 
@@ -263,6 +264,11 @@ class UpwiseChatPlugin:
         # 하네스의 기준 회차가 바뀌기 때문이다 - 제품에서만 부른다.
         self.dock.refresh_keys_state()
         self._log("api keys: %s" % keystore.summary())
+        # 0.7.0 꽂는 지점. 모드 판정을 **어댑터**에서 읽게 한다 - 백엔드가
+        # 아직 없을 때(첫 전송 전)도 UI 가 맞아야 하므로 독이 백엔드를 보고
+        # 가르면 안 된다(docs/13 5).
+        self.dock.set_backend_mode(self.backend_adapter)
+        self._log("llm keys: %s" % llmkeys.summary())
         self.dock.visibilityChanged.connect(self._on_dock_visibility_changed)
         self.iface.addDockWidget(Qt.RightDockWidgetArea, self.dock)
 
@@ -463,7 +469,41 @@ class UpwiseChatPlugin:
             self.prereq.note_embedded_python(*probe.result)
 
     def _make_backend(self):
-        """독이 첫 전송에서 부르는 공장. 포스처 R 로 시작한다(설계 3-3)."""
+        """독이 첫 전송에서 부르는 공장. **여기가 전송 분기 1곳이다.**
+
+        0.7.0(docs/13 2-6, I-5): 어댑터 종류로 전송 계층을 가른다. 같은 독에
+        Claude 모드와 API 모드가 **동시에 붙지 않는다** - 분기가 한 곳이고
+        모드 전환은 백엔드 교체이기 때문이다.
+
+        왜 `isinstance` 로 가르는가
+            판정식을 `capabilities.long_lived` 로 두지 **않는다**. Codex
+            어댑터가 `long_lived=False` 이면서 spawn 계열이므로 그 축으로는
+            갈리지 않는다(docs/7 3-3). 능력 플래그는 **기능 유무**를 말하고
+            전송 종류를 말하지 않는다 - 그 둘을 섞으면 Codex 가 들어올 때
+            조용히 틀린 분기를 탄다.
+
+        API 모드에서 건너뛰는 적재 작업 3개(docs/13 2-6)
+            `write_mcp_config`(모델이 MCP 를 안 본다), `_await_python()`
+            (`-I` 인터프리터가 필요한 것은 MCP 서버와 수집 서버다),
+            `plugin_dirs`(스킬 번들, `skill_bundle=False`). 셋이 전부
+            `_make_spec` 안에 있고 **`ApiBackend` 는 그 공장을 받지 않으므로**
+            구조적으로 호출되지 않는다. 건너뛰기를 조건문으로 적지 않는
+            이유가 그것이다 - 적으면 두 곳이 같은 사실을 말한다.
+
+            건너뛰지 않는 것은 `EmbeddedServer.start()` 다. 내장 서버는
+            **플러그인 수명**에 묶여 있고 사용자가 세션 중에 Claude 모드로
+            돌아갈 수 있다. 서버를 모드에 따라 켜고 끄면 포트와 토큰이
+            바뀌고 그 경로는 측정된 적이 없다. 비용은 소켓 1개다.
+
+        Returns:
+            process.BackendProcess 또는 apibackend.ApiBackend.
+        """
+        adp = self.backend_adapter
+        if isinstance(adp, adapter_api.ApiAdapterBase):
+            backend = apibackend.ApiBackend(adp, parent=None)
+            backend.gate_result.connect(self._on_gate_result)
+            self._log("backend factory: api provider=%s" % adp.name)
+            return backend
         spec_posture = self.backend_adapter.posture_spec()
         backend = process.BackendProcess(
             self._make_spec,
@@ -484,6 +524,12 @@ class UpwiseChatPlugin:
     def _on_gate_result(self, result):
         """첫 init 으로 전제조건을 채운다(설계 6-4). 판정은 독이 쓴다."""
         if self.prereq is None or not isinstance(result, dict):
+            return
+        if isinstance(self.backend_adapter, adapter_api.ApiAdapterBase):
+            # API 모드는 MCP 축을 쓰지 않는다. 그대로 돌리면 전제조건 바에
+            # "지도 제어 미연결" 이 뜨는데, 그 모드에서 그것은 미충족이
+            # 아니라 **사실**이고 상시 고지 1줄이 이미 말한다(docs/13 5-1).
+            # 사유 없는 경고를 남기지 않는 쪽이다.
             return
         # check_init 이 돌려주는 요약에는 plugins/skills 가 없다. 그래서 탐지
         # 전량은 독이 백엔드의 init 원본(process.last_init_event)으로 돌린다

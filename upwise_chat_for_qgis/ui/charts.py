@@ -65,6 +65,21 @@ USAGE_PERCENT_FMT = "%d%%"
 USAGE_COST_FMT = "이번 대화 누적 %s"
 USAGE_COST_VALUE_FMT = "$%.4f"
 USAGE_EMPTY = "아직 사용량 정보가 없습니다. 답변을 한 번 받으면 표시됩니다."
+
+# API 모드 토큰 행(0.7.0, docs/13 5-4). **달러는 띄우지 않는다.**
+#
+# 왜 금액을 안 적는가: `result.total_cost_usd` 가 실려 오는 것은 Claude Code
+# 가 계산해 주기 때문이고 **API 응답에는 금액이 없다.** 금액을 띄우려면
+# 단가표를 플러그인에 박아야 하고 단가는 바뀐다. 플러그인이 한 번 출하되면
+# 그 숫자가 몇 달 그대로 남아 사용자에게 **틀린 금액**을 보여 준다. 검증할
+# 수 없는 값을 UI 에 쓰지 않는다는 규칙이 여기 적용된다.
+USAGE_TOKENS_TOTAL_FMT = "누적 토큰 입력 %s . 출력 %s . 턴 %d"
+USAGE_TOKENS_LAST_FMT = "직전 턴 입력 %s . 출력 %s"
+
+# 값이 없을 때 적는 것. **0 을 적지 않는다** - 0 은 "안 썼다" 로 읽히고
+# 그것은 거짓이다. OpenAI 호환 모드는 `stream_options` 를 안 보내므로
+# usage 가 대개 오지 않는다(docs/13 2-2-1).
+USAGE_TOKENS_NONE = "-"
 USAGE_TIP = (
     "Claude 가 보내 주는 사용 한도 정보입니다. 5시간 창과 7일 창의 사용 "
     "비율이고, 비용은 이번 대화에서 지금까지 쓴 금액입니다."
@@ -212,6 +227,35 @@ def usage_from_event(event):
         win = windows.get(name)
         value = win.get("utilization") if isinstance(win, dict) else None
         out.append(float(value) if isinstance(value, (int, float)) else None)
+    return out[0], out[1]
+
+
+def usage_tokens_from_event(event):
+    """`result` 한 건이 싣고 온 `usage` 에서 입출력 토큰을 꺼낸다(0.7.0).
+
+    **키가 없으면 None 이다.** 0 으로 떨어뜨리지 않는 이유는 "안 왔다" 와
+    "0 이었다" 가 다른 사실이기 때문이다 - API 백엔드는 모르는 키를 넣지
+    않는 계약이고(`apiclient` 번역기의 `usage()`), UI 는 그 자리에 "-" 를
+    적는다.
+
+    Args:
+        event: `result` 이벤트 dict.
+
+    Returns:
+        tuple: (input_tokens, output_tokens). 각각 int 또는 None.
+    """
+    if not isinstance(event, dict):
+        return None, None
+    usage = event.get("usage")
+    if not isinstance(usage, dict):
+        return None, None
+    out = []
+    for name in ("input_tokens", "output_tokens"):
+        value = usage.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            out.append(None)
+        else:
+            out.append(value)
     return out[0], out[1]
 
 
@@ -420,6 +464,35 @@ class UsageCard(_ChartCard):
         self.cost_label.setMinimumWidth(1)
         theme_mod.set_role(self.cost_label, theme_mod.ROLE_MUTED)
         self.body_layout.addWidget(self.cost_label)
+
+        # ----- API 모드 토큰 행 2개(0.7.0, docs/13 5-4) -----
+        #
+        # 모드에 따라 행 구성을 가른다. Claude 모드에서는 숨어 있고
+        # (그 모드의 `result` 에는 우리가 읽는 `usage` 모양이 없다)
+        # API 모드에서는 게이지와 USD 행이 숨고 이 둘이 보인다.
+        self._api_mode = False
+        self._tok_input = None
+        self._tok_output = None
+        self._tok_turns = 0
+        self._tok_last_input = None
+        self._tok_last_output = None
+
+        self.tokens_label = QLabel("", self.body)
+        self.tokens_label.setObjectName("UpwiseChatUsageTokens")
+        self.tokens_label.setWordWrap(True)
+        self.tokens_label.setMinimumWidth(1)
+        theme_mod.set_role(self.tokens_label, theme_mod.ROLE_MUTED)
+        self.body_layout.addWidget(self.tokens_label)
+
+        self.tokens_last_label = QLabel("", self.body)
+        self.tokens_last_label.setObjectName("UpwiseChatUsageTokensLast")
+        self.tokens_last_label.setWordWrap(True)
+        self.tokens_last_label.setMinimumWidth(1)
+        theme_mod.set_role(self.tokens_last_label, theme_mod.ROLE_CAPTION)
+        self.body_layout.addWidget(self.tokens_last_label)
+        self.tokens_label.setVisible(False)
+        self.tokens_last_label.setVisible(False)
+
         self._refresh_text()
 
     def _add_row(self, grid, row, text, name):
@@ -457,6 +530,71 @@ class UsageCard(_ChartCard):
                           else USAGE_PERCENT_FMT % int(round(ratio * 100)))
         self.cost_label.setText(
             USAGE_COST_FMT % (USAGE_COST_VALUE_FMT % self._cost_usd))
+        self.tokens_label.setText(USAGE_TOKENS_TOTAL_FMT % (
+            self._token_text(self._tok_input),
+            self._token_text(self._tok_output), self._tok_turns))
+        self.tokens_last_label.setText(USAGE_TOKENS_LAST_FMT % (
+            self._token_text(self._tok_last_input),
+            self._token_text(self._tok_last_output)))
+
+    @staticmethod
+    def _token_text(value):
+        """토큰 수 하나를 글자로. None 은 "-" 다(0 을 적지 않는다)."""
+        return USAGE_TOKENS_NONE if value is None else "%d" % value
+
+    def set_api_mode(self, api_mode):
+        """행 구성을 모드에 맞춘다(0.7.0, docs/13 5-4).
+
+        API 모드에서 숨기는 것과 그 이유
+            5시간/7일 게이지  `rate_limit_event` 가 오지 않는다. 빈 게이지를
+                두면 "한도를 다 썼다" 로도 "0% 다" 로도 읽힌다.
+            누적 비용(USD)  API 응답에 금액이 없다(모듈 상수 주석).
+
+        Args:
+            api_mode: API 직결 백엔드인가.
+
+        Returns:
+            bool: 적용된 모드.
+        """
+        self._api_mode = bool(api_mode)
+        for bar_name in ("five_hour_bar", "seven_day_bar"):
+            bar = getattr(self, bar_name, None)
+            if bar is not None:
+                bar.setVisible(not self._api_mode)
+        for name in ("UpwiseChatUsageFiveHour", "UpwiseChatUsageSevenDay"):
+            self._value_label(name).setVisible(not self._api_mode)
+            label = self.findChild(QLabel, name + "Label")
+            if label is not None:
+                label.setVisible(not self._api_mode)
+        self.cost_label.setVisible(not self._api_mode)
+        self.tokens_label.setVisible(self._api_mode)
+        self.tokens_last_label.setVisible(self._api_mode)
+        return self._api_mode
+
+    def add_tokens(self, input_tokens, output_tokens):
+        """턴 1개의 토큰 수를 누계에 넣는다(0.7.0).
+
+        **모르는 값은 0 으로 세지 않는다.** 누계는 값이 온 턴만 더하고,
+        직전 턴 칸은 안 온 값을 None 으로 둬 "-" 로 그려진다.
+
+        Args:
+            input_tokens: 입력 토큰 수 또는 None.
+            output_tokens: 출력 토큰 수 또는 None.
+
+        Returns:
+            int: 센 턴 수.
+        """
+        self._tok_turns += 1
+        self._tok_last_input = input_tokens
+        self._tok_last_output = output_tokens
+        if input_tokens is not None:
+            self._tok_input = (self._tok_input or 0) + int(input_tokens)
+        if output_tokens is not None:
+            self._tok_output = (self._tok_output or 0) + int(output_tokens)
+        self._refresh_text()
+        # 토큰만 와도 보여 줄 것이 생긴다.
+        self._show_empty(False)
+        return self._tok_turns
 
     def set_usage(self, five_hour, seven_day):
         """두 창의 사용 비율을 넣는다.
@@ -585,6 +723,13 @@ class UsageCard(_ChartCard):
         self._cost_carried = 0.0
         self._cost_session = 0.0
         self._cost_session_id = None
+        # 토큰 누계도 함께 비운다(0.7.0). "누적" 문구가 대화 단위이므로
+        # 비용과 같은 자리에서 리셋돼야 한다.
+        self._tok_input = None
+        self._tok_output = None
+        self._tok_turns = 0
+        self._tok_last_input = None
+        self._tok_last_output = None
         self._refresh_text()
         self._show_empty(True)
         return self._cost_usd
@@ -617,6 +762,14 @@ class UsageCard(_ChartCard):
                 if usd is not None:
                     self.add_cost(usd, event.get("session_id"))
                     cost_n += 1
+                if self._api_mode:
+                    # API 모드 토큰 행(0.7.0). 금액 키가 없는 쪽이라
+                    # 위 분기가 안 돌고, 턴 수를 여기서 센다. 모드를 보는
+                    # 이유는 Claude 모드의 `result.usage` 모양을 우리가
+                    # 재지 않았기 때문이다 - 안 쟀으면 읽지 않는다.
+                    tin, tout = usage_tokens_from_event(event)
+                    self.add_tokens(tin, tout)
+                    cost_n += 1
             elif etype == "system" and event.get("subtype") == "init":
                 # 세션 경계 후보. 비용 이벤트가 아니므로 셈에 넣지 않는다 -
                 # `cost_events` 는 "턴이 몇 번 끝났나" 를 세는 창구다.
@@ -636,6 +789,16 @@ class UsageCard(_ChartCard):
             "seven_day_text": self._value_label(
                 "UpwiseChatUsageSevenDay").text(),
             "cost_text": self.cost_label.text(),
+            # 0.7.0 API 모드 행. 하네스 110 G4 가 읽는다.
+            "api_mode": self._api_mode,
+            "tokens_in": self._tok_input,
+            "tokens_out": self._tok_output,
+            "tokens_turns": self._tok_turns,
+            "tokens_text": self.tokens_label.text(),
+            "tokens_last_text": self.tokens_last_label.text(),
+            "tokens_visible": not self.tokens_label.isHidden(),
+            "cost_visible": not self.cost_label.isHidden(),
+            "gauge_visible": not self.five_hour_bar.isHidden(),
         }
 
 

@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.7.0
+
+A second kind of backend. Until now the plugin had one: a long-lived Claude
+Code CLI process that it drives over stream-json, with the map control and the
+tool approval that come with it. This release adds a backend that talks to an
+LLM API directly with a key you supply, and it is **chat only**: it cannot
+control QGIS, it cannot collect data, and it offers the model no tools at all.
+Not released as a build yet.
+
+Two providers ship. One is the Anthropic Messages API. The other is any
+OpenAI-compatible endpoint, which you point at with a base URL, a model name
+and an optional key, so a local server (Ollama, LM Studio, vLLM) works the
+same way as the hosted one. You pick the backend in the key panel, and the
+choice applies from the next **New chat**, as the model choice already did.
+
+- **The dock says what the mode cannot do, and hides what does not apply.** A
+  line in the header reads "this mode is chat only; it cannot control QGIS or
+  collect data". The skill presets, the approval bars, the connection chip and
+  the working folder row are hidden, because none of them has anything to act
+  on when the model has no tools. The permission badge reads "chat only, 0
+  tools" instead of "permission unverified", which looked like a fault. The
+  terminal warning is hidden too: it is about two bridges racing for one
+  socket, and this mode opens no socket.
+- **The send button goes dark during a turn again.** 0.6.1 kept it live and
+  let the CLI queue the message. This backend has no queue, so a message sent
+  during a turn would have been dropped in silence. The button now reads
+  whether the backend has a queue at all; the CLI path is unchanged.
+- **Keys are stored and redacted exactly as the collection keys are.** They
+  live in the QGIS settings file, under their own prefix, and the value leaves
+  only in the HTTP request header. It is redacted from the transcript, the
+  export, every clipboard write, the session recording and the diagnostic log.
+  The summary the plugin logs carries a yes or no, not a length. A **Key
+  check** button asks the provider for its model list, which answers 200 or
+  401 and **spends no tokens**, so you can tell a bad key from a bad address
+  without paying for a turn.
+- **The usage card counts tokens, not dollars.** The API bills per token and
+  the whole conversation is sent again every turn, so the card shows the
+  running input and output totals and the tokens of the last turn, and **New
+  chat** is the only way to reset the conversation and with it the input cost.
+  No amount in dollars is shown: the API response carries no figure, and a
+  price table compiled into a plugin would keep showing a stale one for months
+  after the prices move. Where a provider sends no token count at all, the card
+  prints a dash rather than a zero.
+- **A turn always ends.** Whatever happens to the request, the plugin closes
+  the turn with exactly one result line: an HTTP refusal, a dead connection, a
+  response that is not a stream (an intercepting proxy returning its own login
+  page), silence past five minutes, a provider error mid-stream, or Esc. The
+  message you see names the cause, in the provider's own words where it sent
+  any. Nothing is retried automatically: this is metered, a half-finished
+  stream has already been billed, and sending the same prompt three times
+  without being asked is not a thing a plugin should do.
+
 ## 0.6.2
 
 Two readings in the dock were wrong, and both were wrong in the same way: a

@@ -182,8 +182,10 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from ..backend import adapter_api as adapter_api_mod
 from ..backend import detect as detect_mod
 from ..backend import keystore as keystore_mod
+from ..backend import llmkeys as llmkeys_mod
 from ..backend import logbook as logbook_mod
 from ..backend import machine as machine_mod
 from ..backend import posture as posture_mod
@@ -202,6 +204,7 @@ from .bottom_nav import NAV_CHAT, NAV_KEYS, NAV_STATS, BottomNav
 from .charts import StatsPane
 from .chat_view import ChatView
 from .key_panel import KeyPanel
+from .llm_key_panel import LlmKeyPanel
 from .preset_bar import PostureConfirmBar, PrereqBar, PresetRow, SkillMarkerBar
 
 # QGIS 는 독의 위치와 표시 상태를 objectName 으로 저장하고 복원한다.
@@ -805,7 +808,19 @@ PREFIX_PROJECT_CHANGED = "(프로젝트가 %s 으로 바뀌었습니다)"
 
 # 헤더 상시 1줄(설계 8 "독과 터미널 세션 동시 사용" 행). 탐지할 방법이 없다.
 # MCP 소켓이 단일 직렬이고 브리지가 둘이면 경합한다(F11).
+#
+# 0.7.0: 이 경고는 **CLI 전용**이다. API 모드에는 터미널 세션과 경합할
+# 소켓이 없으므로 그 모드에서는 숨긴다(docs/13 5-1).
 TERMINAL_NOTICE = "터미널 Claude Code 와 동시에 QGIS 를 조작하지 마세요."
+
+# 공공 API 키 버튼의 API 모드 툴팁(0.7.0, docs/13 5-2). 버튼을 **지우지
+# 않는다** - 키 자체는 Claude 모드에서 유효하다. 비활성 사유만 적는다.
+COLLECT_KEYS_API_TIP = "수집은 채팅 전용 모드에서 쓸 수 없습니다."
+
+# API 모드에서 턴이 남긴 사용자 대면 한 줄을 공지로 올릴 때의 접두.
+# 문면 자체는 `apiclient` 가 만든다(그 모듈이 HTTP 상태를 안다) - 독이
+# 사유를 지어내지 않는다.
+NOTICE_API_TURN_FMT = "%s"
 
 # 백엔드 기동 실패 전제조건 항목(설계 7-1 [2] 의 "기동 실패"). 로그인 상태를
 # 탐지하지 않으므로(D07) 사용자에게 터미널 확인을 안내하는 것이 전부다.
@@ -1191,6 +1206,12 @@ class UpwiseChatDock(QDockWidget):
 
         self._backend_factory = backend_factory
         self.backend = None
+        # 백엔드 모드(0.7.0, docs/13 5). **백엔드가 아니라 어댑터**에서
+        # 읽는다 - 첫 전송 전에는 백엔드가 없고 그때도 UI 가 맞아야 한다.
+        # `set_backend_mode()` 가 세우고, 세워지지 않으면 Claude 모드다
+        # (하네스의 가짜 백엔드 경로가 거동을 바꾸지 않게 하는 기본값이다).
+        self._api_mode = False
+        self._api_adapter = None
         self.machine = machine_mod.TurnMachine(on_note=self._on_machine_note)
         # 레다크터는 독이 소유한다(0.2.1, 설계 docs/2 5-4). 전사와 로그북이
         # **같은 객체**를 써야 "레다크션 n건" 이 세 지점 합계가 된다. 목록은
@@ -1429,6 +1450,14 @@ class UpwiseChatDock(QDockWidget):
         self.key_panel = KeyPanel(body)
         self.key_panel.keys_changed.connect(self._on_keys_changed)
 
+        # LLM 키 패널(0.7.0, docs/13 5-5). **같은 칸**에 둔다 - 사용자에게
+        # "키 설정" 은 한 자리이고, 칸을 늘리면 스플리터 칸 수를 전제한
+        # `_resize_key_panel` 과 하네스 `split_count` 가 조용히 어긋난다.
+        # 별 패널인 이유는 그 모듈 docstring 에 있다(수집 카탈로그에 가짜
+        # 제공자를 넣지 않는다).
+        self.llm_key_panel = LlmKeyPanel(body)
+        self.llm_key_panel.keys_changed.connect(self._on_llm_keys_changed)
+
         self.preset_row = PresetRow(body)
         self.preset_row.preset_clicked.connect(self._on_preset_clicked)
         self.preset_row.check_requested.connect(self._on_self_check)
@@ -1612,13 +1641,24 @@ class UpwiseChatDock(QDockWidget):
         self.key_scroll.setWidgetResizable(True)
         self.key_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.key_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.key_scroll.setWidget(self.key_panel)
+        # 0.7.0: 스크롤 내용이 패널 **둘**이다. 컨테이너를 하나 끼워 두 패널을
+        # 세로로 쌓는다. 스플리터 칸 수는 그대로 2 다.
+        self.key_stack = QWidget(self.key_scroll)
+        self.key_stack.setObjectName("UpwiseChatKeyStack")
+        key_stack_layout = QVBoxLayout(self.key_stack)
+        key_stack_layout.setContentsMargins(0, 0, 0, 0)
+        key_stack_layout.setSpacing(4)
+        key_stack_layout.addWidget(self.key_panel)
+        key_stack_layout.addWidget(self.llm_key_panel)
+        key_stack_layout.addStretch(1)
+        self.key_scroll.setWidget(self.key_stack)
         # `QScrollArea.setWidget` 은 내용 위젯을 **보이게 만든다**(PyQt5 실측:
         # 숨긴 위젯의 isHidden 이 setWidget 뒤 False 가 된다). KeyPanel 은
         # 숨은 상태로 생성되는 계약이고(KeyPanel.__init__ 마지막 줄) 그 상태를
         # 하네스가 `key_panel_visible` 로 읽는다. 그래서 여기서 다시 세운다 -
         # 안 하면 적재 직후 "패널이 열려 있다" 고 보고된다.
         self.key_panel.setVisible(False)
+        self.llm_key_panel.setVisible(False)
         self.key_scroll.setVisible(False)
         split.addWidget(self.key_scroll)
 
@@ -1639,7 +1679,10 @@ class UpwiseChatDock(QDockWidget):
         Returns:
             int: 패널 칸에 준 높이(px).
         """
-        want = int(self.key_panel.sizeHint().height())
+        # 0.7.0: 내용이 패널 둘이므로 컨테이너의 sizeHint 를 본다. 한 패널만
+        # 보면 다른 패널 높이가 칸 밖으로 밀려 스크롤로만 닿는다.
+        holder = getattr(self, "key_stack", None) or self.key_panel
+        want = int(holder.sizeHint().height())
         want = max(KEY_PANEL_MIN_H, min(want, KEY_PANEL_MAX_H))
         self.key_scroll.setMinimumHeight(want)
         # 지금 높이를 모르면(아직 안 보임) 전사 최소 높이를 더해 비율만 준다.
@@ -1862,6 +1905,16 @@ class UpwiseChatDock(QDockWidget):
         self.terminal_notice_label.setVisible(True)
         notices.addWidget(self.terminal_notice_label)
 
+        # 채팅 전용 고지 1줄(0.7.0, docs/13 5-1). API 모드에서만 켜지고
+        # 문면은 **어댑터가 쥔다**(`chat_only_notice`) - 독에 백엔드별 문면을
+        # 쌓지 않는다. 터미널 경고와 **배타**다: 터미널 경고는 CLI 전용이고
+        # 이쪽은 API 전용이라 둘이 동시에 켜질 수 없다.
+        self.chat_only_notice_label = QLabel("", self.notice_list)
+        self.chat_only_notice_label.setObjectName("UpwiseChatTerminalNotice")
+        self.chat_only_notice_label.setWordWrap(True)
+        self.chat_only_notice_label.hide()
+        notices.addWidget(self.chat_only_notice_label)
+
         # 공존 안내 1줄(0.3.0, 설계 2-5 조치 2). 같은 QGIS 에 상류 플러그인
         # (T1)이 적재돼 있을 때만 보인다. 터미널 경고와 **다른 줄**인 이유는
         # 사실이 다르기 때문이다 - 터미널 경고는 탐지 불가라 상시이고, 이쪽은
@@ -1956,8 +2009,8 @@ class UpwiseChatDock(QDockWidget):
         Returns:
             list: QLabel 목록. 아직 안 세워졌으면 빈 목록이다.
         """
-        names = ("terminal_notice_label", "coexist_notice_label",
-                 "login_notice_label")
+        names = ("terminal_notice_label", "chat_only_notice_label",
+                 "coexist_notice_label", "login_notice_label")
         out = []
         for name in names:
             label = getattr(self, name, None)
@@ -4064,6 +4117,41 @@ class UpwiseChatDock(QDockWidget):
             added = True
         return added
 
+    def _check_turn_notice(self):
+        """백엔드가 남긴 턴 사유 한 줄을 공지로 올린다(0.7.0, docs/13 5-6).
+
+        왜 필요한가
+            API 모드의 오류는 **턴 실패이고 백엔드 사망이 아니다.** 그래서
+            `backend_died` 경로를 타지 않고, `result.result` 는 전사의
+            말풍선으로 그려지지 않는다(그 자리는 도구 카드 전용이다).
+            `stderr_line` 은 진단 전용이라 사용자에게 안 보인다. 즉 사유를
+            보여 줄 자리가 없었다 - 이 함수가 그 자리다.
+
+            문면을 독이 만들지 않는다. HTTP 상태와 제공자 사유를 아는 것은
+            `apiclient` 이고, 독은 백엔드가 적어 둔 한 줄을 읽어 올린다.
+
+        턴당 한 번이다. 백엔드가 값을 비우는 것으로 중복을 막는다 - 턴
+        번호로 세는 중단 공지와 달리 이 사유는 턴 객체에 붙어 있지 않다.
+
+        Returns:
+            bool: 공지를 새로 붙였는가.
+        """
+        backend = self.backend
+        if backend is None:
+            return False
+        notice = str(getattr(backend, "last_turn_notice", "") or "")
+        if not notice:
+            return False
+        try:
+            backend.last_turn_notice = ""
+        except AttributeError:
+            # 속성을 못 받는 가짜 백엔드다. 같은 줄을 또 적지 않으려고
+            # 여기서 끊는다.
+            return False
+        self.chat_view.add_notice(NOTICE_API_TURN_FMT % notice)
+        self._on_machine_note("turn_notice", notice)
+        return True
+
     def set_cwd(self, path):
         """cwd 표시를 갱신하고 프리셋 활성 상태를 다시 계산한다(설계 7-1 [6], 6-3).
 
@@ -4085,6 +4173,91 @@ class UpwiseChatDock(QDockWidget):
     def set_denial_retry_enabled(self, enabled):
         """거부 재시도 버튼을 쓸 수 있게 한다. 상승 배선(S5)이 부른다."""
         self.denial_bar.set_retry_enabled(enabled)
+
+    # ------------------------------------------------------------------
+    # 백엔드 모드 (0.7.0, docs/13 5)
+    # ------------------------------------------------------------------
+
+    def set_backend_mode(self, adapter):
+        """어댑터를 보고 모드 인식 UI 를 맞춘다(docs/13 5).
+
+        `plugin.initGui` 가 부른다. **백엔드가 아니라 어댑터**를 받는 이유는
+        첫 전송 전(백엔드가 아직 없을 때)에도 UI 가 맞아야 하기 때문이다.
+
+        Args:
+            adapter: `adapter.BackendAdapter` 구현. None 이면 Claude 모드로
+                둔다 - 모드를 모를 때 기능을 가리는 쪽으로 틀리지 않는다.
+
+        Returns:
+            bool: API 모드인가.
+        """
+        self._api_adapter = adapter
+        self._api_mode = bool(
+            adapter is not None
+            and isinstance(adapter, adapter_api_mod.ApiAdapterBase))
+        self._apply_backend_mode()
+        self._on_machine_note(
+            "backend_mode",
+            "api=%s name=%s" % (self._api_mode,
+                                getattr(adapter, "name", "(none)")))
+        return self._api_mode
+
+    def _apply_backend_mode(self):
+        """모드에 따라 고지, 숨김, 배지, 사용량 행을 맞춘다(docs/13 5-1, 5-2).
+
+        숨기는 다섯 요소와 그 이유
+            프리셋 바   스킬과 슬래시가 없다(`skill_bundle=False`).
+            승인 바     도구 승인과 거부가 발생하지 않는다.
+            연결 칩     내장 서버와 무관하다.
+            작업 폴더 행  파일 접근이 없다.
+            포트 라벨   같은 이유(연결 칩과 한 묶음이다).
+
+        **지우지 않는 것**: 공공 API 키 버튼. 키 자체는 Claude 모드에서
+        유효하므로 버튼을 두고 비활성 + 툴팁으로 사유를 적는다. 키 패널에
+        LLM 키 칸이 있으므로 버튼 자체는 눌러야 한다 - 그래서 비활성은
+        **수집 전용 경로**에만 걸린다.
+
+        Returns:
+            bool: API 모드인가.
+        """
+        api = bool(self._api_mode)
+        adapter = self._api_adapter
+        # 상시 고지 1줄. 문면은 어댑터가 쥔다.
+        label = getattr(self, "chat_only_notice_label", None)
+        if label is not None:
+            text = str(getattr(adapter, "chat_only_notice", "")) if api else ""
+            label.setText(text)
+            label.setVisible(bool(text))
+        # 터미널 경고는 CLI 전용이다.
+        terminal = getattr(self, "terminal_notice_label", None)
+        if terminal is not None:
+            terminal.setVisible(not api)
+        # 승인 바는 `denial_bar`·`exclusion_bar` 둘이다(모듈 `approval_bar`
+        # 가 둘을 공급한다). 둘 다 평시에는 접혀 있지만 명시로 숨긴다 -
+        # API 모드에서는 띄울 사건 자체가 없다.
+        for name in ("preset_row", "denial_bar", "exclusion_bar",
+                     "conn_label", "cwd_label"):
+            widget = getattr(self, name, None)
+            if widget is not None and api:
+                widget.setVisible(False)
+        # 권한 배지 문면. "권한 미확인" 은 고장처럼 읽힌다.
+        badge = getattr(self, "badge_label", None)
+        if badge is not None and api:
+            badge.setText(str(getattr(adapter, "chat_only_badge",
+                                      BADGE_UNKNOWN)))
+            badge.setToolTip(str(getattr(adapter, "chat_only_notice", "")))
+            theme_mod.set_state(badge, theme_mod.STATE_OK)
+        # 수집은 채팅 전용 모드에서 쓸 수 없다. 버튼은 남기고 사유만 적는다.
+        row = getattr(self, "preset_row", None)
+        if row is not None and api:
+            row.setToolTip(COLLECT_KEYS_API_TIP)
+        # 사용량 카드 행 구성(docs/13 5-4).
+        pane = getattr(self, "stats_pane", None)
+        card = getattr(pane, "usage_card", None) if pane is not None else None
+        if card is not None:
+            card.set_api_mode(api)
+        self._apply_notice_expanded()
+        return api
 
     # ------------------------------------------------------------------
     # 전제조건과 프리셋 (S6)
@@ -4291,16 +4464,29 @@ class UpwiseChatDock(QDockWidget):
 
         **키 값은 레다크터로만 간다.** 진단에 남기는 것은 수뿐이다.
 
+        0.7.0(docs/13 3-3 H-2): 지울 값 목록이 **합집합**이다 -
+        `keystore.secrets()`(공공 API 키)와 `llmkeys.secrets()`(LLM 키).
+        한쪽만 넣으면 나머지 키가 전사, 내보내기, 클립보드, 녹화, 진단에서
+        안 지워진다. 같은 모양의 사고가 0.5.0 다필드 제공자에서 이미 있었다
+        (`keystore.secrets` docstring).
+
         Returns:
             dict: 레다크터 요약(값 없음). 하네스가 읽는다.
         """
         try:
-            self.redactor.set_secrets(keystore_mod.secrets())
+            secrets = list(keystore_mod.secrets())
+            for value in llmkeys_mod.secrets():
+                if value not in secrets:
+                    secrets.append(value)
+            self.redactor.set_secrets(secrets)
         except Exception as exc:  # noqa: BLE001 - 설정 읽기 실패가 독을 막지 않는다
             self._on_machine_note("keys_read_failed", repr(exc))
         panel = getattr(self, "key_panel", None)
         if panel is not None:
             panel.refresh()
+        llm = getattr(self, "llm_key_panel", None)
+        if llm is not None:
+            llm.refresh()
         if self._prereq is not None:
             self._prereq.refresh_keys()
         self.refresh_prerequisites()
@@ -4321,6 +4507,13 @@ class UpwiseChatDock(QDockWidget):
         if checked:
             panel.refresh()
         panel.setVisible(bool(checked))
+        # 0.7.0: LLM 패널도 같은 토글로 여닫는다. 숨길 때도 함께 숨기는
+        # 이유는 위와 같다(바깥만 숨기면 패널이 자기를 보인다고 보고한다).
+        llm = getattr(self, "llm_key_panel", None)
+        if llm is not None:
+            if checked:
+                llm.refresh()
+            llm.setVisible(bool(checked))
         scroll = getattr(self, "key_scroll", None)
         if scroll is not None:
             scroll.setVisible(bool(checked))
@@ -4352,6 +4545,24 @@ class UpwiseChatDock(QDockWidget):
             int: 설정된 제공자 수.
         """
         self._on_machine_note("keys_changed", "configured=%d" % configured_n)
+        self.refresh_keys_state()
+        return int(configured_n)
+
+    def _on_llm_keys_changed(self, configured_n):
+        """LLM 키 저장/삭제 성공. 레다크션 집합을 다시 맞춘다(0.7.0).
+
+        전제조건 축을 건드리지 않는 이유: LLM 키는 수집 전제조건이 아니고,
+        전송 가능 여부는 `ApiBackend.start()` 의 전송 전 점검이 판정한다.
+        여기서 또 판정하면 두 곳이 같은 사실을 말한다.
+
+        Args:
+            configured_n: 키가 설정된 제공자 수. **값은 오지 않는다.**
+
+        Returns:
+            int: 설정된 제공자 수.
+        """
+        self._on_machine_note("llm_keys_changed",
+                              "configured=%d" % configured_n)
         self.refresh_keys_state()
         return int(configured_n)
 
@@ -4840,6 +5051,11 @@ class UpwiseChatDock(QDockWidget):
         # 중단된 턴 공지(0.6.1). 전사 동기화 뒤다 - 공지 한 줄이 그 턴 글 뒤에
         # 와야 읽는 순서가 맞다(마커·미로그인 공지와 같은 근거).
         self._check_interrupted_turn()
+        # 턴 사유 한 줄(0.7.0). 중단 공지 **뒤**다 - 중단된 턴에는 사유를
+        # 적지 않으므로(`result` 키 부재) 순서가 결과를 바꾸지 않지만,
+        # 사유가 있는 오류 턴에서 "중단" 과 사유가 둘 다 뜨는 일이 없게
+        # 읽는 순서를 고정해 둔다.
+        self._check_turn_notice()
         # 0.6.1 두 조정. 둘 다 **상태머신이 이 배치를 먹은 뒤**라야 한다 -
         # 흐림 해제와 회수 경합의 근거가 그 배치로 갱신된 수명 집합이다.
         self._refresh_bubble_dim()
@@ -4927,9 +5143,20 @@ class UpwiseChatDock(QDockWidget):
             joined = ", ".join(str(f) for f in failed)
             # 재시작을 예약했는지는 백엔드가 안다. 추측하지 않고 읽는다.
             retrying = bool(getattr(self.backend, "gate_restart_pending", False))
+            # 0.7.0(docs/13 3-4): 백엔드가 사유를 말하면 그것을 먼저 쓴다.
+            # 두 상수는 둘 다 "백엔드를 다시 띄웁니다/멈춥니다" 를 말하는데,
+            # 전송 전 점검이 어긋난 상태는 그 둘 중 어느 것도 아니다.
+            reason = str(getattr(self.backend, "gate_block_reason", "") or "")
             self.chat_view.add_notice(
-                (NOTICE_GATE_BLOCKED if retrying else NOTICE_GATE_BLOCKED_FINAL) % joined
+                reason if reason else
+                (NOTICE_GATE_BLOCKED if retrying
+                 else NOTICE_GATE_BLOCKED_FINAL) % joined
             )
+        if self._api_mode:
+            # 배지와 숨김을 다시 박는다. 게이트 통과 분기가 포스처 라벨로
+            # 배지를 덮어쓰는데, API 모드의 포스처 이름("CHAT")은 사용자
+            # 어휘가 아니다(docs/13 5-2).
+            self._apply_backend_mode()
         self._update_controls()
         self._update_status()
 
@@ -5140,7 +5367,12 @@ class UpwiseChatDock(QDockWidget):
         can_type = (has_factory or backend is not None) and not blocked
         self.input_edit.setEnabled(can_type)
         if blocked:
-            placeholder = PLACEHOLDER_GATE_BLOCKED
+            # 0.7.0(docs/13 3-4): 백엔드가 사유를 말하면 **그것을 먼저
+            # 쓴다.** 독의 상수 둘은 "백엔드를 다시 띄웁니다/멈춥니다" 문면
+            # 이고, 키가 없는데 "다시 띄웁니다" 는 틀린 안내다. Claude 경로는
+            # 이 값을 세우지 않으므로 거동이 안 바뀐다.
+            placeholder = (getattr(backend, "gate_block_reason", "")
+                           or PLACEHOLDER_GATE_BLOCKED)
         elif can_type:
             placeholder = PLACEHOLDER_READY
         else:
@@ -5149,7 +5381,15 @@ class UpwiseChatDock(QDockWidget):
         has_text = bool(self.input_edit.toPlainText().strip())
         # `not busy` 를 뺐다(0.6.1 요구사항 1). 입력창은 전부터 busy 와
         # 무관했고 버튼만 꺼져 있었다.
-        self.send_button.setEnabled(can_type and has_text)
+        #
+        # 0.7.0(docs/13 5-3): **큐 없는 백엔드에서 다시 꺼져야 한다.**
+        # 0.6.1 이 `not busy` 를 뺀 것은 CLI 큐에 위임했기 때문이고,
+        # `lifecycle_live()` 가 False 인 백엔드에는 큐가 없다. 지금 상태로
+        # 두면 턴 중 전송이 백엔드에서 조용히 False 로 떨어진다. Claude
+        # 모드는 그 함수가 True 이므로 **거동이 안 바뀐다** - 큐 없는
+        # 백엔드 일반에 맞는 수정이다.
+        self.send_button.setEnabled(
+            can_type and has_text and (not busy or self._lifecycle_live()))
         # 0.6.1: [취소] 는 "지금 턴 중단" 이 됐으므로 **턴이 돌 때만** 누를 수
         # 있다. 1차 배선(7735db1)까지는 `alive or busy` 여서 도는 턴이 없을 때도 백엔드를
         # 재시작할 수 있었다 - 그 조작은 Esc 와 짝이 맞지 않는다(Esc 는 끊을
@@ -5265,6 +5505,16 @@ class UpwiseChatDock(QDockWidget):
             "split_sizes": list(self.body_split.sizes()),
             "split_count": int(self.body_split.count()),
             "split_collapsible": bool(self.body_split.childrenCollapsible()),
+            # 0.7.0 모드 인식 UI. 하네스 110 G 군이 읽는다.
+            "api_mode": bool(self._api_mode),
+            "chat_only_text": self.chat_only_notice_label.text(),
+            "chat_only_visible": not self.chat_only_notice_label.isHidden(),
+            "terminal_notice_visible":
+                not self.terminal_notice_label.isHidden(),
+            "badge_text": self.badge_label.text(),
+            "preset_row_visible": not self.preset_row.isHidden(),
+            "conn_label_visible": not self.conn_label.isHidden(),
+            "cwd_label_visible": not self.cwd_label.isHidden(),
             # 차트 2종과 바텀 내비. 밖에서 "무엇이 그려졌나" 를 읽는 창구다.
             "stats_pane_visible": not self.stats_pane.isHidden(),
             "usage_chart": self.stats_pane.usage_card.stats(),
@@ -5402,4 +5652,7 @@ class UpwiseChatDock(QDockWidget):
         }
         out.update(self.chat_view.stats())
         out.update(self.key_panel.stats())
+        # 0.7.0 LLM 패널. 키 이름이 `llm_` 로 시작하므로 위 두 묶음과
+        # 겹치지 않는다(겹치면 조용히 덮어쓴다).
+        out.update(self.llm_key_panel.stats())
         return out
